@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+import re
 
 from contracts import FormalContract, MAXIMUM_CONTRACT, assess_specification, make_contract
-from loop import run_verification_loop
+from loop import LoopResult, run_verification_loop, save_trace
 from verifier import verify_against_contract, verify_lean
 
 
@@ -132,7 +133,7 @@ theorem clamp_correct (lo hi x : Int) (h : lo ≤ hi) :
             "When lo is no greater than hi, clamp returns a value inside the closed interval [lo, hi].",
             """theorem verifier_locked_contract (lo hi x : Int) (h : lo ≤ hi) :
     lo ≤ clamp lo hi x ∧ clamp lo hi x ≤ hi := by
-  exact solution_correct lo hi x""",
+  exact solution_correct lo hi x h""",
         ),
     ),
 ]
@@ -210,10 +211,35 @@ class BenchmarkResult:
     detail: str
     attempts: int = 1
     execution_source: str = "Fixed case + Lean"
+    loop_result: LoopResult | None = None
+    trace_path: str = ""
 
 
-def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3, use_feedback: bool = True) -> BenchmarkResult:
+def reference_for_contract(case: BenchmarkCase) -> str:
+    """Adapt only the reference theorem name, not its mathematical proposition."""
+    if case.contract is None:
+        raise ValueError("This case has no model contract")
+    old = re.search(r"theorem\s+(\w+)", case.source).group(1)
+    new = re.search(r"theorem\s+(\w+)", case.contract.theorem_statement).group(1)
+    return re.sub(r"\b" + old + r"\b", new, case.source)
+
+
+def preflight_case(case: BenchmarkCase) -> None:
+    contract = case.contract
+    result = verify_against_contract(reference_for_contract(case), contract.verification_wrapper,
+                                     signature=contract.function_signature, theorem=contract.theorem_statement)
+    if not result.passed:
+        raise ValueError(f"Benchmark preflight failed for {case.id}; no model should repair this fixture.\n{result.message}")
+
+
+def preflight_benchmark() -> None:
+    for case in POSITIVE_CASES:
+        preflight_case(case)
+
+
+def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3, use_feedback: bool = True, *, strategy: str | None = None, on_event=None) -> BenchmarkResult:
     if case.expected == "PASS" and agent is not None and case.contract is not None:
+        preflight_case(case)
         loop_result = run_verification_loop(
             case.specification,
             case.contract,
@@ -221,9 +247,12 @@ def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent
             max_attempts=max_attempts,
             on_attempt=lambda number, passed: on_attempt(case.id, number, passed) if on_attempt else None,
             use_feedback=use_feedback,
+            strategy=strategy,
+            on_event=(lambda event: on_event(case.id, event)) if on_event else None,
         )
-        observed = "PASS" if loop_result.passed else "FAIL"
+        observed = "PASS" if loop_result.passed else ("BLOCKED" if loop_result.stop_reason in {"contract", "environment", "api"} else "FAIL")
         detail = loop_result.attempts[-1].verification.message if loop_result.attempts else "The agent produced no attempt."
+        trace = save_trace(loop_result, case.specification, case.contract, case.id + "-" + loop_result.strategy)
         return BenchmarkResult(
             case,
             loop_result.passed,
@@ -231,11 +260,13 @@ def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent
             detail,
             len(loop_result.attempts),
             f"{agent_label} + Lean",
+            loop_result,
+            str(trace),
         )
 
     if case.expected == "CLARIFY":
         if case.clarification_reason:
-            return BenchmarkResult(case, True, "CLARIFY", case.clarification_reason, 1, "Fixed case + semantic clarification check")
+            return BenchmarkResult(case, True, "CLARIFY", case.clarification_reason, 1, "Fixed clarification fixture (not model-generated)")
         clear, detail = assess_specification(case.specification)
         observed = "FORMALIZE" if clear else "CLARIFY"
         return BenchmarkResult(case, observed == case.expected, observed, detail, 1, "Fixed case + clarity checker")
@@ -250,20 +281,30 @@ def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent
     return BenchmarkResult(case, observed == case.expected, observed, result.message, 1, "Fixed case + Lean")
 
 
-def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3, use_feedback: bool = True) -> list[BenchmarkResult]:
+def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3, use_feedback: bool = True, *, strategy: str | None = None, on_event=None, on_case_done=None) -> list[BenchmarkResult]:
     if agent is None:
         return [run_case(case) for case in ALL_CASES]
+    # All model-path wrappers must accept references BEFORE any paid request.
+    preflight_benchmark()
 
     # The five model-generated cases are independent. Run them concurrently so
     # the page does not wait for five full API conversations one after another.
     model_cases = [case for case in ALL_CASES if case.expected == "PASS"]
     fixed_cases = [case for case in ALL_CASES if case.expected != "PASS"]
+    def execute(case):
+        result = run_case(case, agent, agent_label, on_attempt, max_attempts, use_feedback,
+                          strategy=strategy, on_event=on_event)
+        if on_case_done:
+            on_case_done(result)
+        return result
     with ThreadPoolExecutor(max_workers=len(model_cases)) as executor:
-        model_results = list(executor.map(lambda case: run_case(case, agent, agent_label, on_attempt, max_attempts, use_feedback), model_cases))
+        model_results = list(executor.map(execute, model_cases))
     fixed_results = []
     for case in fixed_cases:
         result = run_case(case)
         if on_attempt:
             on_attempt(case.id, 1, result.passed)
+        if on_case_done:
+            on_case_done(result)
         fixed_results.append(result)
     return model_results + fixed_results

@@ -7,13 +7,15 @@ import json
 import os
 import secrets
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from agent import AgentError, DeepSeekAgent, DemoAgent
+from agent import AgentError, DeepSeekAgent, DemoAgent, ModelCall
 from benchmark_cases import BenchmarkResult, run_all_cases
 from contracts import FormalContract, assess_specification
-from loop import LoopResult, run_verification_loop
+from loop import Attempt, LoopResult, STRATEGIES, run_verification_loop, save_trace
+from verifier import VerificationResult
 
 
 DEFAULT_SPEC = """Function name: maximum
@@ -27,20 +29,20 @@ Must satisfy:
 """
 
 # The formal contract is stored server-side; the browser receives only a random token.
-PENDING_CONTRACTS: dict[str, tuple[str, str, FormalContract, int | None]] = {}
+PENDING_CONTRACTS: dict[str, tuple[str, str, FormalContract, int | None, str]] = {}
 PENDING_LOCK = threading.Lock()
 BENCHMARK_JOBS: dict[str, dict] = {}
 VERIFY_JOBS: dict[str, dict] = {}
 
 
-def store_contract(specification: str, mode: str, contract: FormalContract, max_attempts: int | None) -> str:
+def store_contract(specification: str, mode: str, contract: FormalContract, max_attempts: int | None, strategy: str = "diagnostic") -> str:
     token = secrets.token_urlsafe(24)
     with PENDING_LOCK:
-        PENDING_CONTRACTS[token] = (specification, mode, contract, max_attempts)
+        PENDING_CONTRACTS[token] = (specification, mode, contract, max_attempts, strategy)
     return token
 
 
-def take_contract(token: str) -> tuple[str, str, FormalContract, int | None]:
+def take_contract(token: str) -> tuple[str, str, FormalContract, int | None, str]:
     with PENDING_LOCK:
         saved = PENDING_CONTRACTS.pop(token, None)
     if saved is None:
@@ -48,12 +50,24 @@ def take_contract(token: str) -> tuple[str, str, FormalContract, int | None]:
     return saved
 
 
-def start_benchmark_job(max_attempts: int | None, use_feedback: bool) -> str:
+def parse_run_options(values: dict) -> tuple[int | None, str]:
+    choice = values.get("attempts", ["3"])[0]
+    legacy = {"until_success": "diagnostic", "until_success_raw": "raw", "until_success_feedback": "diagnostic"}
+    limit = None if choice in legacy else int(choice)
+    strategy = values.get("strategy", [legacy.get(choice, "diagnostic")])[0]
+    if (limit is not None and not 1 <= limit <= 20) or strategy not in STRATEGIES:
+        raise ValueError("Select a valid execution mode and a limit from 1 to 20.")
+    return limit, strategy
+
+
+def start_benchmark_job(max_attempts: int | None, strategy: str) -> str:
     job_id = secrets.token_urlsafe(16)
     with PENDING_LOCK:
         BENCHMARK_JOBS[job_id] = {
             "status": "running", "completed": 0, "total": 15, "attempts": 0,
-            "current_case": "Starting", "current_attempt": 0, "max_attempts": max_attempts, "use_feedback": use_feedback, "results": None, "error": "",
+            "current_case": "Checking all reference contracts before API calls", "current_attempt": 0,
+            "current_step": "Preflight", "max_attempts": max_attempts, "strategy": strategy,
+            "results": None, "error": "", "attempt_html": "", "case_states": {},
         }
 
     def run() -> None:
@@ -66,11 +80,23 @@ def start_benchmark_job(max_attempts: int | None, use_feedback: bool) -> str:
                     job["attempts"] += 1
                     job["current_case"] = case_id
                     job["current_attempt"] = attempt
-                    if passed or (max_attempts is not None and attempt >= max_attempts):
-                        job["completed"] += 1
+            def event(case_id: str, data: dict) -> None:
+                with PENDING_LOCK:
+                    job = BENCHMARK_JOBS[job_id]
+                    job.update(current_case=case_id, current_attempt=data["attempt"], current_step=data["kind"])
+                    job["case_states"][case_id] = f'{data["kind"]} · submission {data["attempt"]}'
+                    if data["kind"] == "attempt_done":
+                        job["attempt_html"] += render_attempt_card(data["record"], case_id)
 
-            label = "DeepSeek agent + structured feedback" if use_feedback else "DeepSeek agent + raw error"
-            results = run_all_cases(agent, label, progress, max_attempts, use_feedback)
+            def completed(result: BenchmarkResult) -> None:
+                with PENDING_LOCK:
+                    job = BENCHMARK_JOBS[job_id]
+                    job["completed"] += 1
+                    job["case_states"][result.case.id] = result.observed
+
+            label = f"DeepSeek {agent.model} / {STRATEGIES[strategy]}"
+            results = run_all_cases(agent, label, progress, max_attempts, strategy=strategy,
+                                    on_event=event, on_case_done=completed)
             with PENDING_LOCK:
                 BENCHMARK_JOBS[job_id].update({"status": "done", "results": results, "current_case": "Finished"})
         except Exception as exc:
@@ -81,29 +107,33 @@ def start_benchmark_job(max_attempts: int | None, use_feedback: bool) -> str:
     return job_id
 
 
-def start_verify_job(specification: str, mode: str, contract: FormalContract, max_attempts: int | None) -> str:
+def start_verify_job(specification: str, mode: str, contract: FormalContract, max_attempts: int | None, strategy: str = "diagnostic") -> str:
     job_id = secrets.token_urlsafe(16)
     with PENDING_LOCK:
         VERIFY_JOBS[job_id] = {
             "status": "running", "attempts": 0, "current_attempt": 0,
-            "current_step": "Starting", "result": None, "specification": specification, "contract": contract, "max_attempts": max_attempts, "error": "",
+            "current_step": "Starting", "result": None, "specification": specification, "contract": contract,
+            "max_attempts": max_attempts, "error": "", "strategy": strategy, "attempt_html": "",
         }
 
     def run() -> None:
         try:
             agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
 
-            def progress(attempt: int, passed: bool) -> None:
+            def event(data: dict) -> None:
                 with PENDING_LOCK:
                     VERIFY_JOBS[job_id].update({
-                        "attempts": attempt,
-                        "current_attempt": attempt,
-                        "current_step": "Lean accepted the proof" if passed else "Lean failed; sending feedback for repair",
+                        "current_attempt": data["attempt"],
+                        "current_step": data["kind"] + " · " + data.get("message", "")[:300],
                     })
+                    if data["kind"] == "attempt_done":
+                        VERIFY_JOBS[job_id]["attempts"] += 1
+                        VERIFY_JOBS[job_id]["attempt_html"] += render_attempt_card(data["record"])
 
-            result = run_verification_loop(specification, contract, agent, max_attempts=max_attempts, on_attempt=progress)
+            result = run_verification_loop(specification, contract, agent, max_attempts=max_attempts, strategy=strategy, on_event=event)
+            trace = save_trace(result, specification, contract, "web-" + strategy)
             with PENDING_LOCK:
-                VERIFY_JOBS[job_id].update({"status": "done", "result": result, "current_step": "Finished"})
+                VERIFY_JOBS[job_id].update({"status": "done", "result": result, "current_step": "Finished", "trace_path": str(trace)})
         except Exception as exc:
             with PENDING_LOCK:
                 VERIFY_JOBS[job_id].update({"status": "error", "error": str(exc), "current_step": "Stopped"})
@@ -135,6 +165,10 @@ pre { overflow:auto; background:#111827; color:#e5e7eb; padding:16px; border-rad
 pre.feedback { background:#f7f5ef; color:#303746; border:1px solid #e0ddd2; }
 .contract-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }.contract-grid .wide { grid-column:1/-1; }
 .benchmark { width:100%; border-collapse:collapse; background:white; margin-top:18px; }.benchmark th,.benchmark td { border-bottom:1px solid #ddd; padding:12px; text-align:left; }
+.table-scroll { overflow-x:auto; }.progress-track { height:18px;background:#e7eaf2;border-radius:99px;overflow:hidden;margin:22px 0; }
+.busy { height:100%;width:30%;background:var(--blue);animation:busy 1.4s ease-in-out infinite alternate; }
+@keyframes busy { from {transform:translateX(0)} to {transform:translateX(230%)} }
+@media (prefers-reduced-motion:reduce) { .busy { animation:none; } }
 @media (max-width:720px) { .flow,.contract-grid { grid-template-columns:1fr; }.contract-grid .wide { grid-column:auto; } header h1 { font-size:28px; } }
 """
 
@@ -163,14 +197,17 @@ def render_start(specification: str = DEFAULT_SPEC, mode: str = "demo", error: s
 <h2>Step 1 · Describe the function</h2>
 <label for="specification">Natural-language requirement</label>
 <textarea id="specification" name="specification" required>{html.escape(specification)}</textarea>
-<div class="controls"><div><label for="mode">Agent</label><select id="mode" name="mode" onchange="document.getElementById('benchmark-link').href='/benchmark?mode='+encodeURIComponent(this.value)">
+<div class="controls"><div><label for="mode">Agent</label><select id="mode" name="mode" onchange="updateBenchmarkLink()">
 <option value="demo" {'selected' if mode == 'demo' else ''}>Built-in maximum demo</option>
 <option value="deepseek" {'selected' if mode == 'deepseek' else ''}>DeepSeek API</option></select></div>
 <div><label for="attempts">Normal-case retry policy</label><select id="attempts" name="attempts" onchange="updateBenchmarkLink()">
-<option value="3">Try up to 3 times</option><option value="5">Try up to 5 times</option><option value="until_success_raw">Until success</option><option value="until_success_feedback">Until success (feedback)</option></select></div>
+<option value="3">Try up to 3 times</option><option value="5">Try up to 5 times</option><option value="until_success">Until success (max 20 submissions)</option></select></div>
+<div><label for="strategy">Execution mode</label><select id="strategy" name="strategy" onchange="updateBenchmarkLink()">
+<option value="raw">A · Raw Lean errors</option><option value="diagnostic" selected>B · Diagnosis + history</option><option value="staged">C · Checkable steps + diagnosis</option></select></div>
 <button type="submit">Create formal contract</button><a id="benchmark-link" class="button secondary" href="/benchmark?mode={html.escape(mode, quote=True)}&attempts=3" onclick="this.textContent='Running 15 cases...'; this.style.pointerEvents='none'; this.style.opacity='.65';">Run 15-case test set with this Agent</a>
-<span class="hint">DeepSeek API: {'configured' if api_ready else 'DEEPSEEK_API_KEY not set'}</span></div></form>
-<script>function updateBenchmarkLink() {{ const mode = document.getElementById('mode').value; const attempts = document.getElementById('attempts').value; document.getElementById('benchmark-link').href = '/benchmark?mode=' + encodeURIComponent(mode) + '&attempts=' + encodeURIComponent(attempts); }} updateBenchmarkLink();</script>"""
+<span class="hint">DeepSeek API: {'configured' if api_ready else 'DEEPSEEK_API_KEY not set'}</span></div>
+<p class="hint">B/C may use an extra model call to diagnose a failed submission. C verifies intermediate steps; those are not final PASS. The built-in demo is scripted and does not measure feedback quality.</p></form><p><a class="button secondary" href="/comparison">View saved A/B/C comparisons (no API call)</a></p>
+<script>function updateBenchmarkLink() {{ const mode = document.getElementById('mode').value; const attempts = document.getElementById('attempts').value; const strategy = document.getElementById('strategy'); strategy.querySelector('[value="staged"]').disabled = mode !== 'deepseek'; if (mode !== 'deepseek' &amp;&amp; strategy.value === 'staged') strategy.value = 'diagnostic'; document.getElementById('benchmark-link').href = '/benchmark?mode=' + encodeURIComponent(mode) + '&attempts=' + encodeURIComponent(attempts) + '&strategy=' + encodeURIComponent(strategy.value); }} updateBenchmarkLink();</script>""".replace('&amp;&amp;', '&&')
     return page_shell(content, 1)
 
 
@@ -186,36 +223,54 @@ def render_confirmation(specification: str, contract: FormalContract, token: str
     return page_shell(content, 2)
 
 
+def render_attempt_card(attempt: Attempt, case_id: str = "") -> str:
+    status = "STEP ACCEPTED (not final PASS)" if attempt.verification.stage == "intermediate" else ("PASS" if attempt.verification.passed else "FAIL")
+    esc = html.escape
+    plan = "\n".join(f"{i}. {step}" for i, step in enumerate(attempt.plan, 1)) or "No explicit plan in this mode."
+    requests = "".join(f'<details><summary>{esc(call.purpose)} · {esc(call.model)} · exact prompt</summary><pre>{esc(call.system_prompt)}</pre><pre>{esc(call.user_prompt)}</pre><h4>Model response</h4><pre>{esc(call.response)}</pre></details>' for call in attempt.calls)
+    return f'''<details class="attempt"><summary>{esc(case_id)} Attempt {attempt.number} · {status}</summary>
+<p>Step: {esc(attempt.current_step)} · check stage: {esc(attempt.verification.stage)} · {attempt.api_calls} API calls · {attempt.elapsed_seconds:.1f}s</p>
+<h3>Plan</h3><pre class="feedback">{esc(plan)}</pre><h3>Change summary</h3><p>{esc(attempt.change_summary or 'Not separately reported in this mode.')}</p>
+<h3>Feedback actually supplied to this attempt</h3><pre class="feedback">{esc(attempt.feedback_received or 'First submission; no previous feedback.')}</pre>
+<h3>Agent-generated Lean</h3><pre>{esc(attempt.code)}</pre><h3>Verifier evidence</h3><pre class="feedback">{esc(attempt.verification.message)}</pre>
+<h3>Feedback prepared for the next attempt</h3><pre class="feedback">{esc(attempt.repair_feedback or 'No next repair scheduled: completed, stopped, or limit reached.')}</pre>{requests}</details>'''
+
+
 def render_attempts(specification: str, contract: FormalContract, result: LoopResult) -> bytes:
     final_class = "pass" if result.passed else "fail"
-    final_text = "PASS: Lean accepted the locked contract" if result.passed else "FAIL: retry limit reached"
-    cards = [f'<section class="result {final_class}"><h2>{final_text}</h2><p>Attempts: {len(result.attempts)}</p></section>']
+    final_text = "PASS: Lean accepted the locked contract" if result.passed else "NOT PASSED: " + result.stop_reason
+    tokens = str(result.total_tokens) if result.total_tokens is not None else "unavailable"
+    models = ', '.join(sorted({c.model for a in result.attempts for c in a.calls})) or 'Scripted local demo (no API)'
+    cards = [f'<section class="result {final_class}"><h2>{html.escape(final_text)}</h2><p>{html.escape(STRATEGIES[result.strategy])} · Submissions: {len(result.attempts)} · API calls: {result.api_calls} · Tokens: {tokens}</p><p>Reported model: {html.escape(models)}</p><p>Attempts to success: {len(result.attempts) if result.passed else "— (not successful)"}</p><p class="hint">Usage covers this verification loop, excluding earlier formal-contract generation.</p></section>']
     cards.append(f'<section class="card"><h3>Locked theorem</h3><pre>{html.escape(contract.theorem_statement)}</pre></section>')
-    for attempt in result.attempts:
-        status = "PASS" if attempt.verification.passed else "FAIL"
-        repair_feedback = attempt.repair_feedback or "Lean accepted this attempt. No repair feedback is needed."
-        diagnosis = f'<h3>Structured attempt feedback</h3><pre class="feedback">{html.escape(repair_feedback)}</pre>'
-        cards.append(f"""<details open class="attempt"><summary>Attempt {attempt.number} · <span class="{status.lower()}">{status}</span></summary>
-<h3>Agent-generated Lean</h3><pre><code>{html.escape(attempt.code)}</code></pre><h3>Lean feedback</h3>
-<pre class="feedback">{html.escape(attempt.verification.message)}</pre>{diagnosis}</details>""")
+    cards.extend(render_attempt_card(attempt) for attempt in result.attempts)
     cards.append('<p><a class="button secondary" href="/">Start another requirement</a> <a class="button secondary" href="/benchmark">View test set</a></p>')
-    return page_shell("\n".join(cards), 3 if not result.passed else 4)
+    return page_shell("\n".join(cards), 4)
 
 
 def render_benchmark(results: list[BenchmarkResult]) -> bytes:
     passed = sum(result.passed for result in results)
     total_attempts = sum(result.attempts for result in results)
-    model_cases = sum(result.execution_source.endswith("+ Lean") and "Fixed case" not in result.execution_source for result in results)
+    model_cases = sum(result.loop_result is not None for result in results)
+    api_calls = sum(result.loop_result.api_calls for result in results if result.loop_result)
     rows = []
     for result in results:
         status = "PASS" if result.passed else "FAIL"
-        rows.append(f"<tr><td>{html.escape(result.case.id)}</td><td>{html.escape(result.case.group)}</td><td>{html.escape(result.case.description)}</td><td>{result.case.expected}</td><td>{result.observed}</td><td class='{status.lower()}'>{status}</td><td>{result.attempts}</td><td>{html.escape(result.execution_source)}</td></tr>")
+        run = result.loop_result
+        success_attempt = str(result.attempts) if run and run.passed else "—"
+        stop = run.stop_reason if run else "Fixed check"
+        cost = f'{run.api_calls} / {run.total_tokens if run.total_tokens is not None else "unavailable"}' if run else '0 / 0'
+        actual_models = ', '.join(sorted({c.model for a in run.attempts for c in a.calls})) if run else ''
+        source = result.execution_source + (f' (API reports: {actual_models})' if actual_models else '')
+        rows.append(f"<tr><td>{html.escape(result.case.id)}</td><td>{result.case.expected}</td><td>{result.observed}</td><td class='{status.lower()}'>{status}</td><td>{result.attempts}</td><td>{success_attempt}</td><td>{cost}</td><td>{html.escape(stop)}</td><td>{html.escape(source)}</td></tr>")
     content = f"""<section class="result {'pass' if passed == len(results) else 'fail'}"><h2>15-case verifier benchmark: {passed}/{len(results)} passed</h2>
-<p><strong>Summary:</strong> {model_cases} model-generated cases; {len(results) - model_cases} fixed verifier cases; {total_attempts} total attempts.</p>
+<p><strong>Summary:</strong> {model_cases} model-generated cases; {len(results) - model_cases} fixed verifier cases; {total_attempts} total submissions/checks; {api_calls} API calls.</p>
 <p><strong>Execution source:</strong> normal cases use the selected Agent + Lean. Faulty, bypass, and ambiguous cases remain fixed local cases. If the selected Agent is DeepSeek, only the 5 normal cases call the DeepSeek API.</p>
-<p>These cases test valid proofs, faulty implementations, proof bypass attempts, and ambiguous requirements.</p></section>
-<table class="benchmark"><thead><tr><th>ID</th><th>Group</th><th>Purpose</th><th>Expected</th><th>Observed</th><th>Result</th><th>Attempts</th><th>Execution source</th></tr></thead>
-<tbody>{''.join(rows)}</tbody></table><p><a class="button secondary" href="/">Back to prototype</a></p>"""
+<p>Intermediate acceptance is not final PASS. The clarification fixtures are not evidence of model reasoning. PASS proves only the locked formal property.</p></section>
+<div class="table-scroll"><table class="benchmark"><thead><tr><th>ID</th><th>Expected</th><th>Observed</th><th>Result</th><th>Submissions / checks</th><th>Attempts to success</th><th>API calls / tokens</th><th>Stop reason</th><th>Execution source</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table></div>
+{''.join(render_attempt_card(a, r.case.id) for r in results if r.loop_result for a in r.loop_result.attempts)}
+<p><a class="button secondary" href="/">Back to prototype</a></p>"""
     return page_shell(content, 4)
 
 
@@ -223,40 +278,91 @@ def render_benchmark_loading(job_id: str) -> bytes:
     content = f"""<section class="card"><h2>Running 15-case test set...</h2>
 <p id="progress-text">Starting the selected Agent and Lean verifier...</p>
 <div style="height:18px;background:#e7eaf2;border-radius:99px;overflow:hidden;margin:22px 0"><div id="progress-bar" style="height:100%;width:0%;background:var(--blue);transition:width .3s"></div></div>
-<p class="hint">The five normal cases run through the selected Agent. A failed attempt is sent back for repair according to your selected retry policy and feedback mode. “Until success” has a 20-attempt safety limit to protect API usage.</p></section>
+<p class="hint">Progress counts finished cases, including stopped cases. Every task has at most 20 submissions. Three identical outcomes stop early; diagnostics are extra API calls.</p><pre class="feedback" id="case-states"></pre></section><section id="live-attempts"></section>
 <script>
 const jobId = {json.dumps(job_id)};
+let previousHtml = '';
 async function poll() {{
+ try {{
   const response = await fetch('/benchmark/status?job=' + encodeURIComponent(jobId));
+  if (!response.ok) throw new Error('Status unavailable (server may have restarted).');
   const job = await response.json();
   const percent = Math.round(job.completed / job.total * 100);
   document.getElementById('progress-bar').style.width = percent + '%';
-  document.getElementById('progress-text').textContent = `${{percent}}% · ${{job.completed}}/${{job.total}} cases · ${{job.attempts}} total attempts · current: ${{job.current_case}} (attempt ${{job.current_attempt}})`;
+  document.getElementById('progress-text').textContent = `${{percent}}% · ${{job.completed}}/${{job.total}} cases · ${{job.attempts}} submissions/checks · ${{job.current_case}} · ${{job.current_step}} (attempt ${{job.current_attempt}})`;
+  document.getElementById('case-states').textContent = Object.entries(job.case_states).map(([id, state]) => id + ': ' + state).join(String.fromCharCode(10));
+  if (previousHtml !== job.attempt_html) {{ document.getElementById('live-attempts').innerHTML = job.attempt_html; previousHtml = job.attempt_html; }}
   if (job.status === 'done') {{ window.location.href = '/benchmark?job=' + encodeURIComponent(jobId); return; }}
   if (job.status === 'error') {{ document.getElementById('progress-text').textContent = 'Benchmark stopped: ' + job.error; return; }}
-  setTimeout(poll, 800);
+ }} catch (error) {{ document.getElementById('progress-text').textContent = error.message + ' Retrying status...'; }}
+  setTimeout(poll, 1500);
 }}
 poll();
 </script>"""
     return page_shell(content, 4)
 
 
+def render_comparison(filename: str = "") -> bytes:
+    paths = {p.name: p for p in sorted((Path(__file__).parent / '.runs').glob('comparison-*.json'), reverse=True)}
+    if not paths:
+        return page_shell('<section class="card"><h2>No saved comparisons yet</h2><p>Run experiments.py to create a bounded API comparison. Viewing this page never starts a model run.</p></section>', 4)
+    selected = filename or next(iter(paths))
+    if selected not in paths:
+        return page_shell('<section class="result fail"><h2>Unknown comparison</h2></section>', 4)
+    try:
+        data = json.loads(paths[selected].read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return page_shell('<section class="card"><h2>Report is being saved. Please refresh.</h2></section>', 4)
+    esc = html.escape
+    fixed_passed = sum(r['passed'] for r in data['fixed_controls'])
+    actual_models = ', '.join(sorted({c['model'] for r in data['model_runs'] for a in r['attempts'] for c in a['calls']})) or 'Not available yet'
+    summary_rows = []
+    for strategy, label in STRATEGIES.items():
+        runs = [r for r in data['model_runs'] if r['strategy'] == strategy]
+        tokens = sum(r['total_tokens'] for r in runs) if all(r['total_tokens'] is not None for r in runs) else 'unavailable'
+        summary_rows.append(f"<tr><td>{esc(label)}</td><td>{sum(r['passed'] for r in runs)}/{len(runs)}</td><td>{sum(len(r['attempts']) for r in runs)}</td><td>{sum(r['api_calls'] for r in runs)}</td><td>{tokens}</td></tr>")
+    rows, cards = [], []
+    for run in sorted(data['model_runs'], key=lambda r: (r['case'], r['strategy'], r['repetition'])):
+        attempts_to_success = run['attempts_to_success'] if run['passed'] else '—'
+        rows.append(f"<tr><td>{esc(run['case'])}</td><td>{esc(run['strategy'])}</td><td>{run['repetition']}</td><td>{'PASS' if run['passed'] else 'NOT PASSED'}</td><td>{len(run['attempts'])}</td><td>{attempts_to_success}</td><td>{esc(run['stop_reason'])}</td></tr>")
+        for record in run['attempts']:
+            attempt = Attempt(**{**record, 'verification': VerificationResult(**record['verification']),
+                                 'calls': [ModelCall(**c) for c in record['calls']]})
+            cards.append(render_attempt_card(attempt, run['case'] + ' / ' + run['strategy']))
+    links = ' · '.join(f'<a href="/comparison?run={esc(name, quote=True)}">{esc(name)}</a>' for name in paths)
+    content = f'''<section class="card"><h2>Saved A/B/C comparison</h2>
+<p>Report: {esc(selected)} · status: {esc(data['status'])}</p>
+<p>Requested model: {esc(data['model_requested'])} · API-reported model: {esc(actual_models)} · temperature: {data['temperature']} · cap: {data['max_submissions_per_task']} submissions/task</p>
+<p>Fixed controls: {fixed_passed}/10 (run once, shared across modes). Only the five normal cases measure model behavior.</p>
+<p class="hint">{esc(data['note'])} A single comparison does not establish a general improvement.</p>
+<div class="table-scroll"><table class="benchmark"><thead><tr><th>Mode</th><th>Normal tasks passed</th><th>Submissions</th><th>API calls</th><th>Total tokens</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div></section>
+<div class="table-scroll"><table class="benchmark"><thead><tr><th>Case</th><th>Mode</th><th>Repeat</th><th>Outcome</th><th>Submissions</th><th>Attempts to success</th><th>Stop reason</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+<details class="card"><summary>Saved reports</summary>{links}</details>
+<details class="card"><summary>Experiment errors and exact source fingerprints</summary><pre>{esc(json.dumps({'errors': data['errors'], 'source_sha256': data['source_sha256']}, indent=2))}</pre></details>
+{''.join(cards)}<p><a class="button" href="/">Back to prototype</a></p>'''
+    return page_shell(content, 4)
+
+
 def render_verify_loading(job_id: str) -> bytes:
     content = f"""<section class="card"><h2>Verifying the confirmed theorem...</h2>
 <p id="verify-step">Theorem confirmed ✓ · preparing the Agent...</p>
-<div style="height:18px;background:#e7eaf2;border-radius:99px;overflow:hidden;margin:22px 0"><div id="verify-bar" style="height:100%;width:15%;background:var(--blue);transition:width .3s"></div></div>
-<ol><li>Theorem confirmed and locked ✓</li><li>Agent generates the Lean implementation and proof</li><li>Lean checks the code and proof</li><li>If FAIL: return feedback and retry</li></ol></section>
+<div class="progress-track" role="progressbar" aria-label="Verification in progress"><div id="verify-bar" class="busy"></div></div>
+<p class="hint">The animation indicates activity, not a predicted completion percentage. Intermediate steps are checked but never counted as final PASS.</p>
+<ol><li>Theorem confirmed and locked ✓</li><li>Agent prepares a submission</li><li>Lean checks the submitted step or full proof</li><li>Repair, continue, finish, or stop with an explicit reason</li></ol></section><section id="live-attempts"></section>
 <script>
 const jobId = {json.dumps(job_id)};
+let previousHtml = '';
 async function pollVerify() {{
+ try {{
   const response = await fetch('/verify/status?job=' + encodeURIComponent(jobId));
+  if (!response.ok) throw new Error('Status unavailable (server may have restarted).');
   const job = await response.json();
-  const percent = job.status === 'done' ? 100 : Math.min(95, 15 + job.attempts * 28);
-  document.getElementById('verify-bar').style.width = percent + '%';
-  document.getElementById('verify-step').textContent = `${{job.current_step}} · attempt ${{job.current_attempt}}/${{job.max_attempts === null ? 'until success' : job.max_attempts}}`;
+  document.getElementById('verify-step').textContent = `${{job.current_step}} · submission ${{job.current_attempt}}/${{job.max_attempts === null ? 20 : job.max_attempts}} · mode: ${{job.strategy}}`;
+  if (previousHtml !== job.attempt_html) {{ document.getElementById('live-attempts').innerHTML = job.attempt_html; previousHtml = job.attempt_html; }}
   if (job.status === 'done') {{ window.location.href = '/verify?job=' + encodeURIComponent(jobId); return; }}
   if (job.status === 'error') {{ document.getElementById('verify-step').textContent = 'Verification stopped: ' + job.error; return; }}
-  setTimeout(pollVerify, 600);
+ }} catch (error) {{ document.getElementById('verify-step').textContent = error.message + ' Retrying status...'; }}
+  setTimeout(pollVerify, 1500);
 }}
 pollVerify();
 </script>"""
@@ -275,6 +381,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/":
             self._send(render_start())
+        elif parsed.path == "/comparison":
+            self._send(render_comparison(parse_qs(parsed.query).get("run", [""])[0]))
         elif parsed.path == "/formalize":
             self._send(render_stage_info(
                 "Step 2 · Confirm theorem",
@@ -330,10 +438,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             mode = query.get("mode", ["demo"])[0]
             if mode == "deepseek":
-                attempt_choice = query.get("attempts", ["3"])[0]
-                max_attempts = None if attempt_choice.startswith("until_success") else int(attempt_choice)
-                use_feedback = attempt_choice != "until_success_raw"
-                self._send(render_benchmark_loading(start_benchmark_job(max_attempts, use_feedback)))
+                try:
+                    max_attempts, strategy = parse_run_options(query)
+                except ValueError as exc:
+                    self._send(render_start(error=str(exc)), 400)
+                    return
+                self._send(render_benchmark_loading(start_benchmark_job(max_attempts, strategy)))
                 return
             else:
                 results = run_all_cases()
@@ -345,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
                 if job is None:
                     self.send_error(404)
                     return
-                payload = {key: job[key] for key in ("status", "attempts", "current_attempt", "current_step", "max_attempts", "error")}
+                payload = {key: job[key] for key in ("status", "attempts", "current_attempt", "current_step", "max_attempts", "error", "strategy", "attempt_html")}
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -359,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
                 if job is None:
                     self.send_error(404)
                     return
-                payload = {key: job[key] for key in ("status", "completed", "total", "attempts", "current_case", "current_attempt", "error")}
+                payload = {key: job[key] for key in ("status", "completed", "total", "attempts", "current_case", "current_attempt", "error", "current_step", "case_states", "attempt_html", "strategy")}
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -378,24 +488,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         specification = form.get("specification", [""])[0].strip()
         mode = form.get("mode", ["demo"])[0]
-        attempt_choice = form.get("attempts", ["3"])[0]
-        max_attempts = None if attempt_choice.startswith("until_success") else int(attempt_choice)
         try:
             if self.path == "/formalize":
+                max_attempts, strategy = parse_run_options(form)
+                if mode != "deepseek" and strategy == "staged":
+                    raise ValueError("Checkable steps require DeepSeek API; the built-in demo is scripted.")
                 clear, reason = assess_specification(specification)
                 if not clear:
                     self._send(render_start(specification, mode, reason), 400)
                     return
                 agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
                 contract = agent.formalize(specification)
-                token = store_contract(specification, mode, contract, max_attempts)
+                token = store_contract(specification, mode, contract, max_attempts, strategy)
                 self._send(render_confirmation(specification, contract, token))
                 return
 
             if form.get("confirmed", [""])[0] != "yes":
                 raise AgentError("You must confirm the formal contract before verification.")
-            specification, mode, contract, max_attempts = take_contract(form.get("contract_token", [""])[0])
-            self._send(render_verify_loading(start_verify_job(specification, mode, contract, max_attempts)))
+            specification, mode, contract, max_attempts, strategy = take_contract(form.get("contract_token", [""])[0])
+            self._send(render_verify_loading(start_verify_job(specification, mode, contract, max_attempts, strategy)))
         except (AgentError, ValueError) as exc:
             self._send(render_start(specification, mode, str(exc)), 400)
         except Exception as exc:

@@ -7,8 +7,15 @@ import os
 import re
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 
 from contracts import FormalContract, MAXIMUM_CONTRACT
+
+
+ENVIRONMENT_PROMPT = """Environment: Lean 4.33.0, core plus Init.Omega only; Mathlib is NOT installed.
+Declare helper results using `theorem`, not `lemma`: the `lemma` command is unavailable in this restricted environment.
+Do not assume extra syntax or tactics from Mathlib or Batteries. Use fully proved helper theorems without placeholders.
+"""
 
 
 GENERATION_PROMPT = """You generate small, self-contained Lean 4 programs.
@@ -19,8 +26,54 @@ Return only one ```lean fenced code block. The program must contain:
 
 Use only Lean 4 core and `import Init.Omega` when arithmetic automation is needed.
 Never use sorry, admit, axiom, unsafe, partial, extern, run_cmd, #eval, or any other proof bypass.
-Keep the program below 3000 characters.
+Keep the program below 10000 characters. Auxiliary definitions and proved helper lemmas are allowed.
 """
+
+STAGED_PROMPT = """You are implementing and proving a small Lean 4 function in checkable steps.
+Return JSON only: {"status":"continue|complete|clarify", "plan":["short step"],
+"current_step":"short label", "change_summary":"brief change and reason", "code":"cumulative Lean source", "question":""}.
+First identify input cases and proof obligations in a short plan (not a long reasoning transcript).
+Your FIRST submission must use status continue: implement the function and prove at least one useful helper lemma.
+Later submissions may add other proved helpers or finish the exact locked theorem with status complete.
+Every submission is a complete, standalone file, including all earlier definitions it needs.
+Lean will check each submission. Do not claim the task is finished until the full locked contract passes.
+Preserve verified parts where possible; if changing them is necessary, explain the change briefly.
+Use only Lean 4 core and import Init.Omega. No sorry, admit, axiom, unsafe, partial, extern, run_cmd, or #eval.
+No unproved placeholders even in intermediate submissions. Never define verifier_locked_contract.
+Do not weaken the locked theorem, change its arguments, or silently change the user's requirement.
+If the specification conflicts with the contract, return clarify with a concrete question.
+Limit the Lean source to 10000 characters and the plan to 6 short steps.
+"""
+
+DIAGNOSIS_PROMPT = """Diagnose a failed Lean submission using the supplied source and exact verifier output.
+Return JSON with four nonempty string fields: category, evidence, likely_cause, next_action.
+Ground evidence in the actual error and code; do not invent successful checks or missing information.
+Suggest a focused repair, preserving the locked theorem. If earlier repairs repeated the error, propose a different approach.
+This is a repair hypothesis, not a correctness verdict. Never suggest bypassing a proof or weakening acceptance criteria.
+Keep the total response below 1800 characters.
+"""
+
+
+@dataclass(frozen=True)
+class ModelCall:
+    purpose: str
+    model: str
+    system_prompt: str
+    user_prompt: str
+    response: str
+    usage: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Submission:
+    code: str
+    status: str = "complete"
+    plan: list[str] = field(default_factory=list)
+    current_step: str = "Implementation and proof"
+    change_summary: str = ""
+    question: str = ""
+    call: ModelCall | None = None
+    format_error: str = ""
 
 FORMALIZATION_PROMPT = """Translate a concrete natural-language function requirement into a small Lean 4 contract.
 Return JSON only, with exactly these string fields:
@@ -118,13 +171,17 @@ theorem maximum_correct (a b : Int) :
 class DeepSeekAgent:
     """通过 DeepSeek 的 Chat Completions API（OpenAI 兼容）生成或修复 Lean 代码。"""
 
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(self, model: str | None = None, temperature: float = 0.2) -> None:
         self.api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
         self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
+        self.temperature = temperature
         if not self.api_key:
             raise AgentError("DEEPSEEK_API_KEY was not found. Please set the environment variable in your terminal first.")
 
     def _request(self, system_prompt: str, task: str) -> str:
+        return self._call(system_prompt, task, "formalization").response
+
+    def _call(self, system_prompt: str, task: str, purpose: str) -> ModelCall:
         payload = json.dumps(
             {
                 "model": self.model,
@@ -133,6 +190,8 @@ class DeepSeekAgent:
                     {"role": "user", "content": task},
                 ],
                 "stream": False,
+                "temperature": self.temperature,
+                "max_tokens": 4096,
             }
         ).encode("utf-8")
         request = urllib.request.Request(
@@ -158,7 +217,60 @@ class DeepSeekAgent:
         text = choices[0].get("message", {}).get("content", "") if choices else ""
         if not text.strip():
             raise AgentError("The model did not return any readable text.")
-        return text
+        return ModelCall(purpose, data.get("model", self.model), system_prompt, task, text, data.get("usage", {}))
+
+    def submit(self, specification: str, contract: FormalContract, previous_code: str | None,
+               feedback: str | None, strategy: str, history: list[dict], verified_fragment: str,
+               plan: list[str]) -> Submission:
+        task = (f"User specification:\n{specification}\n\nLocked formal contract:\n"
+                f"{contract.function_signature}\n{contract.theorem_statement}\n")
+        if previous_code is not None:
+            task += (f"\nPrevious cumulative code:\n```lean\n{previous_code}\n```\n"
+                     f"\nVerifier feedback for this same task:\n{feedback}\n"
+                     "Repair this submission; preserve the exact locked declarations.\n")
+        if strategy != "raw" and history:
+            task += "\nRecent submission history (do not repeat unsuccessful changes):\n" + json.dumps(history[-5:], ensure_ascii=False)
+        if strategy == "staged":
+            task += ("\nCurrent short plan:\n" + json.dumps(plan, ensure_ascii=False)
+                     + "\nLast Lean-accepted intermediate file (not final acceptance):\n" + (verified_fragment or "None yet")
+                     + "\nSubmit the next checkable step. A continue result is never final PASS.")
+        else:
+            task += "\nGenerate the full implementation and exact theorem proof."
+        system = (STAGED_PROMPT if strategy == "staged" else GENERATION_PROMPT) + "\n" + ENVIRONMENT_PROMPT
+        call = self._call(system, task, "generation")
+        if strategy != "staged":
+            return Submission(extract_lean_code(call.response), call=call)
+        try:
+            data = extract_json_object(call.response)
+            if data.get("status") not in {"continue", "complete", "clarify"}:
+                raise ValueError("status must be continue, complete, or clarify")
+            if not isinstance(data.get("plan"), list) or not all(isinstance(x, str) for x in data["plan"]):
+                raise ValueError("plan must be a list of strings")
+            for key in ("code", "current_step", "change_summary", "question"):
+                if not isinstance(data.get(key), str):
+                    raise ValueError(f"{key} must be a string")
+            if data["status"] == "clarify" and not data["question"].strip():
+                raise ValueError("clarify requires a concrete question")
+            return Submission(data["code"], data["status"], data["plan"][:6], data["current_step"],
+                              data["change_summary"], data["question"], call)
+        except (AgentError, ValueError) as exc:
+            return Submission("", call=call, format_error=str(exc))
+
+    def diagnose(self, specification: str, contract: FormalContract, code: str, error: str,
+                 history: list[dict]) -> tuple[str, ModelCall]:
+        task = json.dumps({"requirement": specification, "locked_theorem": contract.theorem_statement,
+                           "code_with_line_numbers": "\n".join(f"{i}: {line}" for i, line in enumerate(code.splitlines(), 1)),
+                           "verifier_error": error, "recent_history": history[-5:]}, ensure_ascii=False)
+        call = self._call(DIAGNOSIS_PROMPT + "\n" + ENVIRONMENT_PROMPT, task, "diagnosis")
+        try:
+            data = extract_json_object(call.response)
+            fields = ("category", "evidence", "likely_cause", "next_action")
+            if not all(isinstance(data.get(k), str) and data[k].strip() for k in fields):
+                raise ValueError("missing diagnosis fields")
+            feedback = json.dumps({k: data[k] for k in fields}, ensure_ascii=False, indent=2)
+        except (AgentError, ValueError):
+            feedback = "The diagnostic model returned invalid JSON; use the original Lean error below."
+        return feedback, call
 
     def formalize(self, specification: str) -> FormalContract:
         data = extract_json_object(self._request(FORMALIZATION_PROMPT, f"User requirement:\n{specification}"))

@@ -30,6 +30,7 @@ FORBIDDEN_PATTERNS = {
 class VerificationResult:
     passed: bool
     message: str
+    stage: str = "candidate"
 
 
 def diagnose_verification_failure(message: str) -> str:
@@ -82,11 +83,11 @@ def find_lean() -> tuple[str | None, dict[str, str]]:
 def verify_lean(source: str, timeout_seconds: int = 20) -> VerificationResult:
     policy_error = check_source_policy(source)
     if policy_error:
-        return VerificationResult(False, f"Source policy check failed: {policy_error}")
+        return VerificationResult(False, f"Source policy check failed: {policy_error}", "policy")
 
     lean, env = find_lean()
     if not lean:
-        return VerificationResult(False, "Lean was not found. Please run ./install_lean.sh first.")
+        return VerificationResult(False, "Lean was not found. Please run ./install_lean.sh first.", "environment")
 
     temp_root = PROJECT_DIR / ".tmp"
     temp_root.mkdir(exist_ok=True)
@@ -104,9 +105,9 @@ def verify_lean(source: str, timeout_seconds: int = 20) -> VerificationResult:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return VerificationResult(False, f"Lean check exceeded {timeout_seconds}s and was stopped.")
+            return VerificationResult(False, f"Lean check exceeded {timeout_seconds}s and was stopped.", "timeout")
         except OSError as exc:
-            return VerificationResult(False, f"Could not start Lean: {exc}")
+            return VerificationResult(False, f"Could not start Lean: {exc}", "environment")
 
     output = "\n".join(part for part in (completed.stdout, completed.stderr) if part.strip()).strip()
     if completed.returncode == 0:
@@ -114,9 +115,30 @@ def verify_lean(source: str, timeout_seconds: int = 20) -> VerificationResult:
     return VerificationResult(False, output or f"Lean exit code: {completed.returncode}")
 
 
-def verify_against_contract(source: str, verification_wrapper: str, timeout_seconds: int = 20) -> VerificationResult:
+def check_locked_declarations(source: str, signature: str, theorem: str) -> str | None:
+    """A conservative prototype check; not a full Lean parser or security boundary."""
+    normalized = re.sub(r"\s+", "", source)
+    for expected in (signature, theorem):
+        if re.sub(r"\s+", "", expected) + ":=" not in normalized:
+            return "Preserve this exact locked declaration (including every assumption): " + expected
+    return None
+
+
+def verify_against_contract(source: str, verification_wrapper: str, timeout_seconds: int = 20,
+                            *, signature: str = "", theorem: str = "") -> VerificationResult:
     """追加由系统锁定的定理，防止 Agent 仅证明一个更弱的命题。"""
     if "verifier_locked_contract" in source:
-        return VerificationResult(False, "Agent source may not define the reserved verifier_locked_contract theorem.")
+        return VerificationResult(False, "Agent source may not define the reserved verifier_locked_contract theorem.", "policy")
+    if signature and theorem:
+        error = check_locked_declarations(source, signature, theorem)
+        if error:
+            return VerificationResult(False, error, "declaration")
+    candidate = verify_lean(source, timeout_seconds)
+    if not candidate.passed:
+        return candidate
     combined = source.rstrip() + "\n\n-- This theorem is appended by the verifier.\n" + verification_wrapper.strip() + "\n"
-    return verify_lean(combined, timeout_seconds=timeout_seconds)
+    result = verify_lean(combined, timeout_seconds=timeout_seconds)
+    if not result.passed and result.stage not in {"environment", "timeout"}:
+        return VerificationResult(False, "Candidate alone passed; the appended contract check failed. "
+                                  "Review contract integration before retrying.\n" + result.message, "contract")
+    return result
