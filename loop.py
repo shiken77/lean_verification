@@ -37,14 +37,16 @@ def run_verification_loop(
     specification: str,
     contract: FormalContract,
     agent: LeanAgent,
-    max_attempts: int = 3,
+    max_attempts: int | None = 3,
     on_attempt: Callable[[int, bool], None] | None = None,
 ) -> LoopResult:
     previous_code: str | None = None
     error: str | None = None
     attempts: list[Attempt] = []
 
-    for number in range(1, max_attempts + 1):
+    number = 0
+    while max_attempts is None or number < max_attempts:
+        number += 1
         code = agent.generate(specification, contract, previous_code, error)
         verification = verify_against_contract(code, contract.verification_wrapper)
         attempts.append(Attempt(number, code, verification))

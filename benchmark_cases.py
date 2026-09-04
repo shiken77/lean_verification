@@ -210,13 +210,13 @@ class BenchmarkResult:
     execution_source: str = "Fixed case + Lean"
 
 
-def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None) -> BenchmarkResult:
+def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3) -> BenchmarkResult:
     if case.expected == "PASS" and agent is not None and case.contract is not None:
         loop_result = run_verification_loop(
             case.specification,
             case.contract,
             agent,
-            max_attempts=3,
+            max_attempts=max_attempts,
             on_attempt=lambda number, passed: on_attempt(case.id, number, passed) if on_attempt else None,
         )
         observed = "PASS" if loop_result.passed else "FAIL"
@@ -245,7 +245,7 @@ def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent
     return BenchmarkResult(case, observed == case.expected, observed, result.message, 1, "Fixed case + Lean")
 
 
-def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None) -> list[BenchmarkResult]:
+def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3) -> list[BenchmarkResult]:
     if agent is None:
         return [run_case(case) for case in ALL_CASES]
 
@@ -254,7 +254,7 @@ def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: C
     model_cases = [case for case in ALL_CASES if case.expected == "PASS"]
     fixed_cases = [case for case in ALL_CASES if case.expected != "PASS"]
     with ThreadPoolExecutor(max_workers=len(model_cases)) as executor:
-        model_results = list(executor.map(lambda case: run_case(case, agent, agent_label, on_attempt), model_cases))
+        model_results = list(executor.map(lambda case: run_case(case, agent, agent_label, on_attempt, max_attempts), model_cases))
     fixed_results = []
     for case in fixed_cases:
         result = run_case(case)

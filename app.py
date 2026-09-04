@@ -47,12 +47,12 @@ def take_contract(token: str) -> tuple[str, str, FormalContract]:
     return saved
 
 
-def start_benchmark_job() -> str:
+def start_benchmark_job(max_attempts: int | None) -> str:
     job_id = secrets.token_urlsafe(16)
     with PENDING_LOCK:
         BENCHMARK_JOBS[job_id] = {
             "status": "running", "completed": 0, "total": 15, "attempts": 0,
-            "current_case": "Starting", "current_attempt": 0, "results": None, "error": "",
+            "current_case": "Starting", "current_attempt": 0, "max_attempts": max_attempts, "results": None, "error": "",
         }
 
     def run() -> None:
@@ -65,10 +65,10 @@ def start_benchmark_job() -> str:
                     job["attempts"] += 1
                     job["current_case"] = case_id
                     job["current_attempt"] = attempt
-                    if passed or attempt >= 3:
+                    if passed or (max_attempts is not None and attempt >= max_attempts):
                         job["completed"] += 1
 
-            results = run_all_cases(agent, "DeepSeek agent", progress)
+            results = run_all_cases(agent, "DeepSeek agent", progress, max_attempts)
             with PENDING_LOCK:
                 BENCHMARK_JOBS[job_id].update({"status": "done", "results": results, "current_case": "Finished"})
         except Exception as exc:
@@ -133,8 +133,11 @@ def render_start(specification: str = DEFAULT_SPEC, mode: str = "demo", error: s
 <div class="controls"><div><label for="mode">Agent</label><select id="mode" name="mode" onchange="document.getElementById('benchmark-link').href='/benchmark?mode='+encodeURIComponent(this.value)">
 <option value="demo" {'selected' if mode == 'demo' else ''}>Built-in maximum demo</option>
 <option value="deepseek" {'selected' if mode == 'deepseek' else ''}>DeepSeek API</option></select></div>
-<button type="submit">Create formal contract</button><a id="benchmark-link" class="button secondary" href="/benchmark?mode={html.escape(mode, quote=True)}" onclick="this.textContent='Running 15 cases...'; this.style.pointerEvents='none'; this.style.opacity='.65';">Run 15-case test set with this Agent</a>
-<span class="hint">DeepSeek API: {'configured' if api_ready else 'DEEPSEEK_API_KEY not set'}</span></div></form>"""
+<div><label for="attempts">Normal-case retry policy</label><select id="attempts" name="attempts" onchange="updateBenchmarkLink()">
+<option value="3">Try up to 3 times</option><option value="5">Try up to 5 times</option><option value="until_success">Until success</option></select></div>
+<button type="submit">Create formal contract</button><a id="benchmark-link" class="button secondary" href="/benchmark?mode={html.escape(mode, quote=True)}&attempts=3" onclick="this.textContent='Running 15 cases...'; this.style.pointerEvents='none'; this.style.opacity='.65';">Run 15-case test set with this Agent</a>
+<span class="hint">DeepSeek API: {'configured' if api_ready else 'DEEPSEEK_API_KEY not set'}</span></div></form>
+<script>function updateBenchmarkLink() {{ const mode = document.getElementById('mode').value; const attempts = document.getElementById('attempts').value; document.getElementById('benchmark-link').href = '/benchmark?mode=' + encodeURIComponent(mode) + '&attempts=' + encodeURIComponent(attempts); }} updateBenchmarkLink();</script>"""
     return page_shell(content, 1)
 
 
@@ -185,7 +188,7 @@ def render_benchmark_loading(job_id: str) -> bytes:
     content = f"""<section class="card"><h2>Running 15-case test set...</h2>
 <p id="progress-text">Starting the selected Agent and Lean verifier...</p>
 <div style="height:18px;background:#e7eaf2;border-radius:99px;overflow:hidden;margin:22px 0"><div id="progress-bar" style="height:100%;width:0%;background:var(--blue);transition:width .3s"></div></div>
-<p class="hint">The five normal cases run through the selected Agent. A failed attempt is sent back for repair, up to 3 attempts per case.</p></section>
+<p class="hint">The five normal cases run through the selected Agent. A failed attempt is sent back for repair according to your selected retry policy.</p></section>
 <script>
 const jobId = {json.dumps(job_id)};
 async function poll() {{
@@ -251,7 +254,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             mode = query.get("mode", ["demo"])[0]
             if mode == "deepseek":
-                self._send(render_benchmark_loading(start_benchmark_job()))
+                attempt_choice = query.get("attempts", ["3"])[0]
+                max_attempts = None if attempt_choice == "until_success" else int(attempt_choice)
+                self._send(render_benchmark_loading(start_benchmark_job(max_attempts)))
                 return
             else:
                 results = run_all_cases()
