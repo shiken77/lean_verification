@@ -192,9 +192,8 @@ def render_attempts(specification: str, contract: FormalContract, result: LoopRe
     cards.append(f'<section class="card"><h3>Locked theorem</h3><pre>{html.escape(contract.theorem_statement)}</pre></section>')
     for attempt in result.attempts:
         status = "PASS" if attempt.verification.passed else "FAIL"
-        diagnosis = ""
-        if attempt.repair_feedback:
-            diagnosis = f'<h3>Structured repair feedback</h3><pre class="feedback">{html.escape(attempt.repair_feedback)}</pre>'
+        repair_feedback = attempt.repair_feedback or "Lean accepted this attempt. No repair feedback is needed."
+        diagnosis = f'<h3>Structured attempt feedback</h3><pre class="feedback">{html.escape(repair_feedback)}</pre>'
         cards.append(f"""<details open class="attempt"><summary>Attempt {attempt.number} · <span class="{status.lower()}">{status}</span></summary>
 <h3>Agent-generated Lean</h3><pre><code>{html.escape(attempt.code)}</code></pre><h3>Lean feedback</h3>
 <pre class="feedback">{html.escape(attempt.verification.message)}</pre>{diagnosis}</details>""")
