@@ -2,6 +2,8 @@
 
 This project is a small prototype of an AI-assisted software verification loop. It translates a natural-language requirement into Lean code, checks the implementation and proof, and sends failures back to the Agent for repair.
 
+![Lean Verification Loop](docs/lean-verification-loop.png)
+
 ```text
 Natural-language requirement
         ↓
