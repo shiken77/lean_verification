@@ -192,9 +192,12 @@ def render_attempts(specification: str, contract: FormalContract, result: LoopRe
     cards.append(f'<section class="card"><h3>Locked theorem</h3><pre>{html.escape(contract.theorem_statement)}</pre></section>')
     for attempt in result.attempts:
         status = "PASS" if attempt.verification.passed else "FAIL"
+        diagnosis = ""
+        if attempt.repair_feedback:
+            diagnosis = f'<h3>Structured repair feedback</h3><pre class="feedback">{html.escape(attempt.repair_feedback)}</pre>'
         cards.append(f"""<details open class="attempt"><summary>Attempt {attempt.number} · <span class="{status.lower()}">{status}</span></summary>
 <h3>Agent-generated Lean</h3><pre><code>{html.escape(attempt.code)}</code></pre><h3>Lean feedback</h3>
-<pre class="feedback">{html.escape(attempt.verification.message)}</pre></details>""")
+<pre class="feedback">{html.escape(attempt.verification.message)}</pre>{diagnosis}</details>""")
     cards.append('<p><a class="button secondary" href="/">Start another requirement</a> <a class="button secondary" href="/benchmark">View test set</a></p>')
     return page_shell("\n".join(cards), 3 if not result.passed else 4)
 

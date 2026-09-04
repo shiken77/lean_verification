@@ -25,6 +25,7 @@ class Attempt:
     number: int
     code: str
     verification: VerificationResult
+    repair_feedback: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,17 +50,20 @@ def run_verification_loop(
         number += 1
         code = agent.generate(specification, contract, previous_code, error)
         verification = verify_against_contract(code, contract.verification_wrapper)
-        attempts.append(Attempt(number, code, verification))
+        repair_feedback = None
+        if not verification.passed:
+            repair_feedback = (
+                f"This is repair attempt {number + 1} for the same locked task; do not start a new task.\n"
+                f"Diagnosis: {diagnose_verification_failure(verification.message)}\n"
+                f"Required action: preserve the exact locked theorem and repair the previous program.\n"
+                f"Lean error: {verification.message}"
+            )
+        attempts.append(Attempt(number, code, verification, repair_feedback))
         if on_attempt is not None:
             on_attempt(number, verification.passed)
         if verification.passed:
             return LoopResult(True, attempts)
         previous_code = code
-        error = (
-            f"This is repair attempt {number + 1} for the same locked task; do not start a new task.\n"
-            f"Diagnosis: {diagnose_verification_failure(verification.message)}\n"
-            f"Required action: preserve the exact locked theorem and repair the previous program.\n"
-            f"Lean error: {verification.message}"
-        )
+        error = repair_feedback
 
     return LoopResult(False, attempts)
