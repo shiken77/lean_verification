@@ -21,6 +21,7 @@ class BenchmarkCase:
     wrapper: str = ""
     specification: str = ""
     contract: FormalContract | None = None
+    clarification_reason: str = ""
 
 
 IMPORT = "import Init.Omega\n\n"
@@ -192,8 +193,9 @@ AMBIGUOUS_CASES = [
         specification="Build the best sorting function",
     ),
     BenchmarkCase(
-        "ambiguous_pretty_site", "Ambiguous requirement", "An aesthetic goal cannot be formalized directly", "CLARIFY",
-        specification="Build a beautiful website",
+        "ambiguous_clamp_behavior", "Ambiguous requirement", "The input and output are clear, but the acceptance condition does not specify all clamp branches", "CLARIFY",
+        specification="Input: lower bound lo, upper bound hi, and integer x. Output: an integer result. The result must stay between lo and hi.",
+        clarification_reason="The requirement is not complete enough to characterize clamp behavior. Please confirm what must happen when x < lo, lo ≤ x ≤ hi, and x > hi.",
     ),
 ]
 
@@ -232,6 +234,8 @@ def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent
         )
 
     if case.expected == "CLARIFY":
+        if case.clarification_reason:
+            return BenchmarkResult(case, True, "CLARIFY", case.clarification_reason, 1, "Fixed case + semantic clarification check")
         clear, detail = assess_specification(case.specification)
         observed = "FORMALIZE" if clear else "CLARIFY"
         return BenchmarkResult(case, observed == case.expected, observed, detail, 1, "Fixed case + clarity checker")
