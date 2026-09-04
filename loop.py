@@ -10,6 +10,11 @@ from contracts import FormalContract
 from verifier import VerificationResult, diagnose_verification_failure, verify_against_contract
 
 
+# "Until success" needs a practical guard: a model can remain stuck on the
+# same proof obligation forever, which would otherwise spend API tokens forever.
+UNTIL_SUCCESS_SAFETY_LIMIT = 20
+
+
 class LeanAgent(Protocol):
     def generate(
         self,
@@ -47,7 +52,8 @@ def run_verification_loop(
     attempts: list[Attempt] = []
 
     number = 0
-    while max_attempts is None or number < max_attempts:
+    attempt_limit = UNTIL_SUCCESS_SAFETY_LIMIT if max_attempts is None else max_attempts
+    while number < attempt_limit:
         number += 1
         code = agent.generate(specification, contract, previous_code, error)
         verification = verify_against_contract(code, contract.verification_wrapper)

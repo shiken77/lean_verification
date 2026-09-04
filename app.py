@@ -223,7 +223,7 @@ def render_benchmark_loading(job_id: str) -> bytes:
     content = f"""<section class="card"><h2>Running 15-case test set...</h2>
 <p id="progress-text">Starting the selected Agent and Lean verifier...</p>
 <div style="height:18px;background:#e7eaf2;border-radius:99px;overflow:hidden;margin:22px 0"><div id="progress-bar" style="height:100%;width:0%;background:var(--blue);transition:width .3s"></div></div>
-<p class="hint">The five normal cases run through the selected Agent. A failed attempt is sent back for repair according to your selected retry policy and feedback mode.</p></section>
+<p class="hint">The five normal cases run through the selected Agent. A failed attempt is sent back for repair according to your selected retry policy and feedback mode. “Until success” has a 20-attempt safety limit to protect API usage.</p></section>
 <script>
 const jobId = {json.dumps(job_id)};
 async function poll() {{
