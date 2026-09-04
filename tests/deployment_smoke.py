@@ -2,21 +2,21 @@
 from __future__ import annotations
 
 import base64
+import argparse
 import http.client
 import json
 import re
-import sys
 import time
 from urllib.parse import urlencode, urlsplit
 
 
-def smoke(base_url: str) -> None:
+def smoke(base_url: str, *, public_mode: bool = False) -> None:
     target = urlsplit(base_url)
     if target.scheme != "http" or target.hostname != "127.0.0.1":
         raise ValueError("This CI smoke check only targets a localhost container.")
     credential = "Basic " + base64.b64encode(b"guest:test-only-access-password").decode()
 
-    def request(method, path, form=None, auth=True):
+    def request(method, path, form=None, auth=not public_mode):
         connection = http.client.HTTPConnection(target.hostname, target.port, timeout=10)
         headers = {"Authorization": credential} if auth else {}
         body = urlencode(form).encode() if form is not None else None
@@ -40,7 +40,8 @@ def smoke(base_url: str) -> None:
             raise RuntimeError("Container did not become healthy within 60 seconds")
         time.sleep(0.5)
 
-    assert request("GET", "/", auth=False)[0] == 401, "Anonymous access was not blocked"
+    expected_status = 200 if public_mode else 401
+    assert request("GET", "/", auth=False)[0] == expected_status, "Unexpected anonymous access policy"
     status, _, body = request("GET", "/")
     assert status == 200
     token = re.search(r'name="form_token" value="([^"]+)"', body).group(1)
@@ -70,8 +71,13 @@ def smoke(base_url: str) -> None:
     assert status == 200 and "PASS: Lean accepted" in body, body
     assert "Attempts to success: 2" in body, body
     assert "API calls: 0" in body, body
-    print("Container smoke passed: healthy, authentication, form protection, real Lean FAIL -> PASS, zero API calls.")
+    mode = "public, no password" if public_mode else "password protected"
+    print(f"Container smoke passed: {mode}, healthy, form protection, real Lean FAIL -> PASS, zero API calls.")
 
 
 if __name__ == "__main__":
-    smoke(sys.argv[1])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("url")
+    parser.add_argument("--public", action="store_true", dest="public_mode")
+    args = parser.parse_args()
+    smoke(args.url, public_mode=args.public_mode)

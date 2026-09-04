@@ -47,8 +47,19 @@ jobs:
       - name: Check startup, access protection and real Lean loop
         run: python3 tests/deployment_smoke.py http://127.0.0.1:18765
 
+      - name: Start the default public container without a password
+        run: >-
+          docker run --detach --name lean-public-smoke --memory 512m
+          --publish 127.0.0.1:18766:10000
+          lean-verification:ci
+
+      - name: Check password-free startup and real Lean loop
+        run: python3 tests/deployment_smoke.py http://127.0.0.1:18766 --public
+
       - name: Show logs and remove the test container
         if: always()
         run: |
           docker logs lean-deployment-smoke || true
           docker rm --force lean-deployment-smoke || true
+          docker logs lean-public-smoke || true
+          docker rm --force lean-public-smoke || true

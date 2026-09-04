@@ -9,13 +9,11 @@ services:
     healthCheckPath: /healthz
     autoDeployTrigger: checksPass
     envVars:
-      - key: APP_ACCESS_PASSWORD
-        sync: false
       - key: DEEPSEEK_API_KEY
         sync: false
       - key: DEEPSEEK_MODEL
         value: deepseek-chat
       - key: APP_REQUIRE_AUTH
-        value: "1"
+        value: "0"
       - key: BENCHMARK_WORKERS
         value: "1"

@@ -44,7 +44,7 @@ class BusyError(AgentError):
 
 
 def check_web_capacity() -> None:
-    """Call under PENDING_LOCK. This is a one-process, friends-only demo."""
+    """Call under PENDING_LOCK. This is a one-process research demo."""
     if FORMALIZING or any(job["status"] == "running" for jobs in (BENCHMARK_JOBS, VERIFY_JOBS) for job in jobs.values()):
         raise BusyError("Another task is running. Please wait for it to finish before starting a new one.")
     # Bound retained results; this is deliberately not durable job storage.
@@ -56,7 +56,10 @@ def check_web_capacity() -> None:
 def server_address() -> tuple[str, int]:
     host = os.environ.get("HOST", "127.0.0.1")
     password = os.environ.get("APP_ACCESS_PASSWORD", "")
-    required = os.environ.get("APP_REQUIRE_AUTH") == "1" or host not in {"127.0.0.1", "localhost", "::1"}
+    auth_mode = os.environ.get("APP_REQUIRE_AUTH")
+    # Public access must be explicit. The Render image opts out by default;
+    # a configured password still enables the optional login in either mode.
+    required = auth_mode == "1" or (auth_mode != "0" and host not in {"127.0.0.1", "localhost", "::1"})
     if (required or password) and len(password) < 16:
         raise ValueError("Set APP_ACCESS_PASSWORD to a unique password of at least 16 characters before exposing this app.")
     return host, int(os.environ.get("PORT", "8765"))
@@ -220,6 +223,9 @@ pre.feedback { background:#f7f5ef; color:#303746; border:1px solid #e0ddd2; }
 
 
 def page_shell(content: str, active_step: int = 1) -> bytes:
+    public_notice = ""
+    if os.environ.get("APP_REQUIRE_AUTH") == "0" and not os.environ.get("APP_ACCESS_PASSWORD"):
+        public_notice = '<p class="hint" role="note">Public research demo · No login. Model requests use the owner\'s DeepSeek credit. Do not enter private information; results are not private.</p>'
     steps = [
         ("1. Function spec", "/"),
         ("2. Confirm theorem", "/formalize"),
@@ -233,7 +239,7 @@ def page_shell(content: str, active_step: int = 1) -> bytes:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lean Verification Loop</title><style>{CSS}</style></head><body><main>
 <header><h1>Lean Verification Loop</h1><p>Requirement → formal contract → human confirmation → implementation and proof → Lean verification</p></header>
-<section class="flow">{flow}</section>{content}</main></body></html>""".encode("utf-8")
+<section class="flow">{flow}</section>{public_notice}{content}</main></body></html>""".encode("utf-8")
 
 
 def render_start(specification: str = DEFAULT_SPEC, mode: str = "demo", error: str = "") -> bytes:

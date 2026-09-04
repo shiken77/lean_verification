@@ -39,6 +39,15 @@ class DeploymentConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.server_address()
 
+    def test_explicit_public_mode_can_bind_without_a_password(self):
+        with patch.dict(os.environ, {"HOST": "0.0.0.0", "PORT": "10000", "APP_REQUIRE_AUTH": "0"}, clear=True):
+            self.assertEqual(app.server_address(), ("0.0.0.0", 10000))
+
+    def test_optional_password_must_still_be_valid_in_public_mode(self):
+        with patch.dict(os.environ, {"APP_REQUIRE_AUTH": "0", "APP_ACCESS_PASSWORD": "short"}, clear=True):
+            with self.assertRaises(ValueError):
+                app.server_address()
+
     def test_lean_does_not_inherit_api_credentials(self):
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake", "APP_ACCESS_PASSWORD": TEST_PASSWORD,
                                      "SOME_OTHER_SECRET": "fake", "PATH": "/usr/bin", "LEAN_CMD": "/test/lean"}):
@@ -114,6 +123,33 @@ class DeploymentHTTPTests(unittest.TestCase):
         with patch.dict(os.environ, {"APP_ACCESS_PASSWORD": ""}):
             self.assertEqual(self.request("GET", "/", auth=False)[0], 503)
 
+    def test_public_mode_opens_pages_without_exposing_api_key(self):
+        with patch.dict(os.environ, {"APP_REQUIRE_AUTH": "0", "APP_ACCESS_PASSWORD": "", "DEEPSEEK_API_KEY": "fake-secret-must-stay-server-side"}):
+            for path in ("/", "/formalize", "/verify", "/benchmark", "/comparison"):
+                status, headers, body = self.request("GET", path, auth=False)
+                self.assertEqual(status, 200)
+                self.assertNotIn("WWW-Authenticate", headers)
+                self.assertNotIn("fake-secret-must-stay-server-side", body)
+                self.assertIn("Public research demo", body)
+            self.assertEqual(self.request("GET", "/verify/status?job=missing", auth=False)[0], 404)
+
+    def test_configured_password_still_enables_optional_login(self):
+        with patch.dict(os.environ, {"APP_REQUIRE_AUTH": "0"}):
+            self.assertEqual(self.request("GET", "/", auth=False)[0], 401)
+            self.assertEqual(self.request("GET", "/")[0], 200)
+
+    def test_public_mode_preserves_deepseek_submission_and_form_protection(self):
+        with patch.dict(os.environ, {"APP_REQUIRE_AUTH": "0", "APP_ACCESS_PASSWORD": ""}):
+            with patch("app.start_benchmark_job", return_value="public-job") as start:
+                self.assertEqual(self.request("POST", "/benchmark", {"mode": "deepseek"}, auth=False)[0], 403)
+                start.assert_not_called()
+                status, headers, _ = self.request("POST", "/benchmark", {
+                    "form_token": app.FORM_TOKEN, "mode": "deepseek", "attempts": "5", "strategy": "staged",
+                }, auth=False)
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], "/benchmark?job=public-job")
+            start.assert_called_once_with(5, "staged")
+
     def test_get_benchmark_never_starts_work(self):
         with patch("app.start_benchmark_job") as start, patch("app.run_all_cases") as run:
             self.assertEqual(self.request("GET", "/benchmark?mode=deepseek&attempts=until_success")[0], 200)
@@ -160,15 +196,22 @@ class DeploymentHTTPTests(unittest.TestCase):
         self.assertLess(len(app.VERIFY_JOBS), 10)
 
     def test_real_demo_confirmation_and_verification(self):
+        self.exercise_real_demo(auth=True)
+
+    def test_real_demo_works_without_a_password(self):
+        with patch.dict(os.environ, {"APP_REQUIRE_AUTH": "0", "APP_ACCESS_PASSWORD": ""}):
+            self.exercise_real_demo(auth=False)
+
+    def exercise_real_demo(self, *, auth):
         status, _, body = self.request("POST", "/formalize", {
             "form_token": app.FORM_TOKEN, "specification": app.DEFAULT_SPEC, "mode": "demo", "attempts": "3",
-        })
+        }, auth=auth)
         self.assertEqual(status, 200)
         token = re.search(r'name="contract_token" value="([^"]+)"', body).group(1)
         with patch("app.save_trace", return_value=Path("/test-trace-not-written")):
             status, headers, _ = self.request("POST", "/verify", {
                 "form_token": app.FORM_TOKEN, "contract_token": token, "confirmed": "yes",
-            })
+            }, auth=auth)
             self.assertEqual(status, 303)
             job_id = headers["Location"].split("job=")[1]
             deadline = time.monotonic() + 30
@@ -184,7 +227,7 @@ class DeploymentHTTPTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(len(result.attempts), 2)
         self.assertEqual(result.api_calls, 0)
-        status, _, body = self.request("GET", headers["Location"])
+        status, _, body = self.request("GET", headers["Location"], auth=auth)
         self.assertEqual(status, 200)
         self.assertIn("PASS: Lean accepted", body)
 
