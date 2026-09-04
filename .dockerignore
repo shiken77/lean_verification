@@ -1,0 +1,12 @@
+.git
+.github
+.elan
+.tmp
+.runs
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+.DS_Store
+*.pem
+*.key

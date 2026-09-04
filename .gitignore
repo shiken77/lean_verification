@@ -3,3 +3,5 @@
 __pycache__/
 tests/__pycache__/
 .runs/
+.env
+.env.*

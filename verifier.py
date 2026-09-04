@@ -67,8 +67,11 @@ def check_source_policy(source: str) -> str | None:
 
 def find_lean() -> tuple[str | None, dict[str, str]]:
     """优先使用项目内 Lean，其次使用系统 PATH 中的 Lean。"""
-    env = os.environ.copy()
-    configured = env.get("LEAN_CMD", "").strip()
+    # Reduce accidental credential exposure. This is NOT process isolation:
+    # Lean still shares the app's OS user and must only receive trusted inputs.
+    allowed = {"PATH", "HOME", "ELAN_HOME", "LEAN_PATH", "LEAN_SYSROOT", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    configured = os.environ.get("LEAN_CMD", "").strip()
     if configured:
         return configured, env
 

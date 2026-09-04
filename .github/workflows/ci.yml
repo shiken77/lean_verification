@@ -23,3 +23,32 @@ jobs:
 
       - name: Run Python tests and 15-case benchmark
         run: python3 -m unittest discover -s tests -v
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build the Render image (no API credentials)
+        run: docker build --tag lean-verification:ci .
+
+      - name: Run tests in the container
+        run: docker run --rm --memory 512m lean-verification:ci python3 -m unittest discover -s tests -v
+
+      - name: Start password-protected container
+        run: >-
+          docker run --detach --name lean-deployment-smoke --memory 512m
+          --publish 127.0.0.1:18765:10000
+          --env APP_ACCESS_PASSWORD=test-only-access-password
+          lean-verification:ci
+
+      - name: Check startup, access protection and real Lean loop
+        run: python3 tests/deployment_smoke.py http://127.0.0.1:18765
+
+      - name: Show logs and remove the test container
+        if: always()
+        run: |
+          docker logs lean-deployment-smoke || true
+          docker rm --force lean-deployment-smoke || true

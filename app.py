@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+import base64
+import binascii
 import json
 import os
 import secrets
@@ -30,14 +32,45 @@ Must satisfy:
 
 # The formal contract is stored server-side; the browser receives only a random token.
 PENDING_CONTRACTS: dict[str, tuple[str, str, FormalContract, int | None, str]] = {}
-PENDING_LOCK = threading.Lock()
+PENDING_LOCK = threading.RLock()
 BENCHMARK_JOBS: dict[str, dict] = {}
 VERIFY_JOBS: dict[str, dict] = {}
+FORM_TOKEN = secrets.token_urlsafe(32)
+FORMALIZING = False
+
+
+class BusyError(AgentError):
+    pass
+
+
+def check_web_capacity() -> None:
+    """Call under PENDING_LOCK. This is a one-process, friends-only demo."""
+    if FORMALIZING or any(job["status"] == "running" for jobs in (BENCHMARK_JOBS, VERIFY_JOBS) for job in jobs.values()):
+        raise BusyError("Another task is running. Please wait for it to finish before starting a new one.")
+    # Bound retained results; this is deliberately not durable job storage.
+    for jobs in (BENCHMARK_JOBS, VERIFY_JOBS):
+        while len(jobs) >= 10:
+            jobs.pop(next(iter(jobs)))
+
+
+def server_address() -> tuple[str, int]:
+    host = os.environ.get("HOST", "127.0.0.1")
+    password = os.environ.get("APP_ACCESS_PASSWORD", "")
+    required = os.environ.get("APP_REQUIRE_AUTH") == "1" or host not in {"127.0.0.1", "localhost", "::1"}
+    if (required or password) and len(password) < 16:
+        raise ValueError("Set APP_ACCESS_PASSWORD to a unique password of at least 16 characters before exposing this app.")
+    return host, int(os.environ.get("PORT", "8765"))
+
+
+def form_token_input() -> str:
+    return f'<input type="hidden" name="form_token" value="{FORM_TOKEN}">'
 
 
 def store_contract(specification: str, mode: str, contract: FormalContract, max_attempts: int | None, strategy: str = "diagnostic") -> str:
     token = secrets.token_urlsafe(24)
     with PENDING_LOCK:
+        while len(PENDING_CONTRACTS) >= 100:
+            PENDING_CONTRACTS.pop(next(iter(PENDING_CONTRACTS)))
         PENDING_CONTRACTS[token] = (specification, mode, contract, max_attempts, strategy)
     return token
 
@@ -63,6 +96,7 @@ def parse_run_options(values: dict) -> tuple[int | None, str]:
 def start_benchmark_job(max_attempts: int | None, strategy: str) -> str:
     job_id = secrets.token_urlsafe(16)
     with PENDING_LOCK:
+        check_web_capacity()
         BENCHMARK_JOBS[job_id] = {
             "status": "running", "completed": 0, "total": 15, "attempts": 0,
             "current_case": "Checking all reference contracts before API calls", "current_attempt": 0,
@@ -96,20 +130,27 @@ def start_benchmark_job(max_attempts: int | None, strategy: str) -> str:
 
             label = f"DeepSeek {agent.model} / {STRATEGIES[strategy]}"
             results = run_all_cases(agent, label, progress, max_attempts, strategy=strategy,
-                                    on_event=event, on_case_done=completed)
+                                    on_event=event, on_case_done=completed,
+                                    workers=int(os.environ.get("BENCHMARK_WORKERS", "5")))
             with PENDING_LOCK:
                 BENCHMARK_JOBS[job_id].update({"status": "done", "results": results, "current_case": "Finished"})
         except Exception as exc:
             with PENDING_LOCK:
                 BENCHMARK_JOBS[job_id].update({"status": "error", "error": str(exc)})
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:
+        with PENDING_LOCK:
+            BENCHMARK_JOBS.pop(job_id, None)
+        raise
     return job_id
 
 
 def start_verify_job(specification: str, mode: str, contract: FormalContract, max_attempts: int | None, strategy: str = "diagnostic") -> str:
     job_id = secrets.token_urlsafe(16)
     with PENDING_LOCK:
+        check_web_capacity()
         VERIFY_JOBS[job_id] = {
             "status": "running", "attempts": 0, "current_attempt": 0,
             "current_step": "Starting", "result": None, "specification": specification, "contract": contract,
@@ -138,7 +179,12 @@ def start_verify_job(specification: str, mode: str, contract: FormalContract, ma
             with PENDING_LOCK:
                 VERIFY_JOBS[job_id].update({"status": "error", "error": str(exc), "current_step": "Stopped"})
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:
+        with PENDING_LOCK:
+            VERIFY_JOBS.pop(job_id, None)
+        raise
     return job_id
 
 CSS = """
@@ -193,7 +239,7 @@ def page_shell(content: str, active_step: int = 1) -> bytes:
 def render_start(specification: str = DEFAULT_SPEC, mode: str = "demo", error: str = "") -> bytes:
     api_ready = bool(os.environ.get("DEEPSEEK_API_KEY"))
     error_html = f'<section class="result fail"><h2>More information needed</h2><p>{html.escape(error)}</p></section>' if error else ""
-    content = f"""{error_html}<form method="post" action="/formalize">
+    content = f"""{error_html}<form method="post" action="/formalize">{form_token_input()}
 <h2>Step 1 · Describe the function</h2>
 <label for="specification">Natural-language requirement</label>
 <textarea id="specification" name="specification" required>{html.escape(specification)}</textarea>
@@ -204,10 +250,10 @@ def render_start(specification: str = DEFAULT_SPEC, mode: str = "demo", error: s
 <option value="3">Try up to 3 times</option><option value="5">Try up to 5 times</option><option value="until_success">Until success (max 20 submissions)</option></select></div>
 <div><label for="strategy">Execution mode</label><select id="strategy" name="strategy" onchange="updateBenchmarkLink()">
 <option value="raw">A · Raw Lean errors</option><option value="diagnostic" selected>B · Diagnosis + history</option><option value="staged">C · Checkable steps + diagnosis</option></select></div>
-<button type="submit">Create formal contract</button><a id="benchmark-link" class="button secondary" href="/benchmark?mode={html.escape(mode, quote=True)}&attempts=3" onclick="this.textContent='Running 15 cases...'; this.style.pointerEvents='none'; this.style.opacity='.65';">Run 15-case test set with this Agent</a>
+<button type="submit">Create formal contract</button><button type="submit" id="benchmark-link" class="secondary" formaction="/benchmark" formnovalidate>Run 15-case test set with this Agent</button>
 <span class="hint">DeepSeek API: {'configured' if api_ready else 'DEEPSEEK_API_KEY not set'}</span></div>
 <p class="hint">B/C may use an extra model call to diagnose a failed submission. C verifies intermediate steps; those are not final PASS. The built-in demo is scripted and does not measure feedback quality.</p></form><p><a class="button secondary" href="/comparison">View saved A/B/C comparisons (no API call)</a></p>
-<script>function updateBenchmarkLink() {{ const mode = document.getElementById('mode').value; const attempts = document.getElementById('attempts').value; const strategy = document.getElementById('strategy'); strategy.querySelector('[value="staged"]').disabled = mode !== 'deepseek'; if (mode !== 'deepseek' &amp;&amp; strategy.value === 'staged') strategy.value = 'diagnostic'; document.getElementById('benchmark-link').href = '/benchmark?mode=' + encodeURIComponent(mode) + '&attempts=' + encodeURIComponent(attempts) + '&strategy=' + encodeURIComponent(strategy.value); }} updateBenchmarkLink();</script>""".replace('&amp;&amp;', '&&')
+<script>function updateBenchmarkLink() {{ const mode = document.getElementById('mode').value; const strategy = document.getElementById('strategy'); strategy.querySelector('[value="staged"]').disabled = mode !== 'deepseek'; if (mode !== 'deepseek' &amp;&amp; strategy.value === 'staged') strategy.value = 'diagnostic'; }} updateBenchmarkLink();</script>""".replace('&amp;&amp;', '&&')
     return page_shell(content, 1)
 
 
@@ -217,7 +263,7 @@ def render_confirmation(specification: str, contract: FormalContract, token: str
 <div class="contract-grid"><div><h3>Function signature</h3><pre>{html.escape(contract.function_signature)}</pre></div>
 <div><h3>Plain-language meaning</h3><p>{html.escape(contract.explanation)}</p></div>
 <div class="wide"><h3>Correctness theorem</h3><pre>{html.escape(contract.theorem_statement)}</pre></div></div></section>
-<form method="post" action="/verify"><input type="hidden" name="contract_token" value="{html.escape(token, quote=True)}">
+<form method="post" action="/verify">{form_token_input()}<input type="hidden" name="contract_token" value="{html.escape(token, quote=True)}">
 <label><input type="checkbox" name="confirmed" value="yes" required> I confirm that this theorem expresses my requirement.</label>
 <div class="controls"><button type="submit">Confirm, generate and verify</button><a class="button secondary" href="/">Go back and revise</a></div></form>"""
     return page_shell(content, 2)
@@ -377,8 +423,41 @@ def render_stage_info(title: str, description: str, next_href: str, next_label: 
 
 
 class Handler(BaseHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        super().end_headers()
+
+    def _authorized(self) -> bool:
+        password = os.environ.get("APP_ACCESS_PASSWORD", "")
+        if not password:
+            if os.environ.get("APP_REQUIRE_AUTH") == "1":
+                self.send_error(503, "Access protection is not configured")
+                return False
+            return True
+        expected = ("guest:" + password).encode("utf-8")
+        try:
+            scheme, value = self.headers.get("Authorization", "").split(" ", 1)
+            received = base64.b64decode(value, validate=True)
+            if scheme.lower() == "basic" and secrets.compare_digest(received, expected):
+                return True
+        except (ValueError, binascii.Error):
+            pass
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Lean friends demo", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
+        if parsed.path == "/healthz":
+            self._send(b"ok")
+            return
+        if not self._authorized():
+            return
         if parsed.path == "/":
             self._send(render_start())
         elif parsed.path == "/comparison":
@@ -436,18 +515,8 @@ class Handler(BaseHTTPRequestHandler):
                     results = job["results"]
                 self._send(render_benchmark(results))
                 return
-            mode = query.get("mode", ["demo"])[0]
-            if mode == "deepseek":
-                try:
-                    max_attempts, strategy = parse_run_options(query)
-                except ValueError as exc:
-                    self._send(render_start(error=str(exc)), 400)
-                    return
-                self._send(render_benchmark_loading(start_benchmark_job(max_attempts, strategy)))
-                return
-            else:
-                results = run_all_cases()
-            self._send(render_benchmark(results))
+            # Opening, prefetching, or refreshing a link must never start paid work.
+            self._send(render_stage_info("15-case test set", "Select an Agent and click Run 15-case test set on the home page. Opening this page does not start a new run.", "/", "Choose Agent and run options", 4))
         elif parsed.path == "/verify/status":
             job_id = parse_qs(parsed.query).get("job", [""])[0]
             with PENDING_LOCK:
@@ -480,15 +549,37 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:
-        if self.path not in {"/formalize", "/verify"}:
+        global FORMALIZING
+        if not self._authorized():
+            return
+        if self.path not in {"/formalize", "/verify", "/benchmark"}:
             self.send_error(404)
             return
         form = self._read_form()
         if form is None:
             return
+        if not secrets.compare_digest(form.get("form_token", [""])[0].encode(), FORM_TOKEN.encode()):
+            self.send_error(403, "Refresh the page before submitting this form")
+            return
         specification = form.get("specification", [""])[0].strip()
         mode = form.get("mode", ["demo"])[0]
         try:
+            if mode not in {"demo", "deepseek"}:
+                raise ValueError("Select a supported Agent.")
+            if self.path == "/benchmark":
+                max_attempts, strategy = parse_run_options(form)
+                if mode == "deepseek":
+                    self._redirect("/benchmark?job=" + start_benchmark_job(max_attempts, strategy))
+                else:
+                    with PENDING_LOCK:
+                        check_web_capacity()
+                        FORMALIZING = True
+                    try:
+                        self._send(render_benchmark(run_all_cases()))
+                    finally:
+                        with PENDING_LOCK:
+                            FORMALIZING = False
+                return
             if self.path == "/formalize":
                 max_attempts, strategy = parse_run_options(form)
                 if mode != "deepseek" and strategy == "staged":
@@ -497,27 +588,60 @@ class Handler(BaseHTTPRequestHandler):
                 if not clear:
                     self._send(render_start(specification, mode, reason), 400)
                     return
-                agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
-                contract = agent.formalize(specification)
+                with PENDING_LOCK:
+                    check_web_capacity()
+                    FORMALIZING = True
+                try:
+                    agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
+                    contract = agent.formalize(specification)
+                finally:
+                    with PENDING_LOCK:
+                        FORMALIZING = False
                 token = store_contract(specification, mode, contract, max_attempts, strategy)
                 self._send(render_confirmation(specification, contract, token))
                 return
 
             if form.get("confirmed", [""])[0] != "yes":
                 raise AgentError("You must confirm the formal contract before verification.")
-            specification, mode, contract, max_attempts, strategy = take_contract(form.get("contract_token", [""])[0])
-            self._send(render_verify_loading(start_verify_job(specification, mode, contract, max_attempts, strategy)))
+            with PENDING_LOCK:
+                check_web_capacity()  # Do not consume a confirmation while another task is busy.
+                token = form.get("contract_token", [""])[0]
+                saved = take_contract(token)
+                try:
+                    job_id = start_verify_job(*saved)
+                except Exception:
+                    PENDING_CONTRACTS[token] = saved
+                    raise
+            self._redirect("/verify?job=" + job_id)
+        except BusyError as exc:
+            self._send(render_start(specification, mode, str(exc)), 429)
         except (AgentError, ValueError) as exc:
             self._send(render_start(specification, mode, str(exc)), 400)
         except Exception as exc:
             self._send(render_start(specification, mode, f"Unexpected error: {exc}"), 500)
 
     def _read_form(self) -> dict[str, list[str]] | None:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or self.headers.get("Transfer-Encoding"):
+                raise ValueError("Invalid request length")
+        except ValueError:
+            self.send_error(400)
+            return None
         if length > 50_000:
             self.send_error(413)
             return None
-        return parse_qs(self.rfile.read(length).decode("utf-8"))
+        try:
+            return parse_qs(self.rfile.read(length).decode("utf-8"), max_num_fields=20)
+        except (UnicodeDecodeError, ValueError):
+            self.send_error(400)
+            return None
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send(self, body: bytes, status: int = 200) -> None:
         self.send_response(status)
@@ -531,6 +655,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    address = ("127.0.0.1", int(os.environ.get("PORT", "8765")))
+    address = server_address()
+    # Fail the deployment before reporting healthy if Lean is missing or broken.
+    from verifier import verify_lean
+    readiness = verify_lean("theorem deployment_ready : True := by trivial")
+    if not readiness.passed:
+        raise SystemExit("Lean startup check failed: " + readiness.message)
     print(f"Lean verification prototype: http://{address[0]}:{address[1]}")
     ThreadingHTTPServer(address, Handler).serve_forever()

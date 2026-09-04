@@ -281,7 +281,9 @@ def run_case(case: BenchmarkCase, agent=None, agent_label: str = "Selected agent
     return BenchmarkResult(case, observed == case.expected, observed, result.message, 1, "Fixed case + Lean")
 
 
-def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3, use_feedback: bool = True, *, strategy: str | None = None, on_event=None, on_case_done=None) -> list[BenchmarkResult]:
+def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: Callable[[str, int, bool], None] | None = None, max_attempts: int | None = 3, use_feedback: bool = True, *, strategy: str | None = None, on_event=None, on_case_done=None, workers: int = 5) -> list[BenchmarkResult]:
+    if not 1 <= workers <= 5:
+        raise ValueError("Benchmark workers must be between 1 and 5.")
     if agent is None:
         return [run_case(case) for case in ALL_CASES]
     # All model-path wrappers must accept references BEFORE any paid request.
@@ -297,7 +299,7 @@ def run_all_cases(agent=None, agent_label: str = "Selected agent", on_attempt: C
         if on_case_done:
             on_case_done(result)
         return result
-    with ThreadPoolExecutor(max_workers=len(model_cases)) as executor:
+    with ThreadPoolExecutor(max_workers=min(workers, len(model_cases))) as executor:
         model_results = list(executor.map(execute, model_cases))
     fixed_results = []
     for case in fixed_cases:

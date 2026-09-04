@@ -173,6 +173,31 @@ On every push and pull request, GitHub automatically checks out the repository, 
 
 The GitHub Action does not call the DeepSeek API. It provides a reproducible check of the verifier and fixed benchmark cases.
 
+## Deploy a password-protected friends demo on Render
+
+This is a **trusted-input research demo**, not a public code-execution service. A shared password restricts access but does not sandbox generated Lean. Only invite trusted collaborators, review submitted requirements, and use a separate low-budget API key. Do not submit secrets or sensitive data. Anyone with the shared password can access retained results; there are no separate user accounts.
+
+1. In [Render](https://dashboard.render.com/), select **New → Web Service → Git Provider** and connect only the `shiken77/lean_verification` repository. Connecting a Git provider (instead of pasting a public-repository URL) enables automatic deployment.
+2. Choose **Docker** as the language/runtime, `main` as the branch, **Singapore** as the region, and **Free** for the initial trial. Leave Root Directory empty and Dockerfile Path as `./Dockerfile`. The image installs the pinned Lean toolchain and includes Python. Do not add a Python build/start command; the Dockerfile supplies the start command.
+3. Under Environment Variables, set `APP_ACCESS_PASSWORD` to a unique random password of at least 16 characters. For the website login, the username is **`guest`** and the password is this value. Use HTTPS. Do not commit the password to Git.
+4. The first deployment can omit `DEEPSEEK_API_KEY` and use the no-cost built-in demo. To enable model-generated answers, add your own `DEEPSEEK_API_KEY` in Render's private environment settings and set `DEEPSEEK_MODEL=deepseek-chat`. Do not paste a key into chat, source files, build commands, or the Dockerfile. Rotate any previously exposed key.
+5. Under Advanced, set **Health Check Path** to `/healthz`. Choose **After CI Checks Pass** for Auto-Deploy (also available in service Settings). Wait for the repository's tests and Docker smoke checks to pass before the first deployment.
+6. Create the web service. Once it is **Live**, open the exact HTTPS URL shown by Render. It should ask for the login; then run the built-in maximum demo and confirm the real Lean loop reports FAIL → PASS. Share that URL and the access password privately with your friends, never the API key.
+
+The repository also includes `render.yaml` for an alternative **New → Blueprint** setup. Use either the Web Service flow or the Blueprint flow, not both, to avoid duplicate services. The Blueprint explicitly selects the free plan and prompts for secrets. For a demo-only Blueprint, leave the API-key prompt blank if allowed; otherwise use the manual Web Service flow.
+
+### Hosted-demo defaults and limits
+
+- The container runs as a non-root user and binds to `0.0.0.0:$PORT` (default `10000`). Local `python3 app.py` remains on `127.0.0.1:8765`. Non-local binding refuses to start without a password of at least 16 characters.
+- A small Lean proof is checked before the server starts. `/healthz` is a cheap unauthenticated health endpoint; it does not call the model or launch a benchmark.
+- All app pages and status endpoints require the shared login when configured. Forms require a per-process anti-forgery token. Opening a link cannot start a paid benchmark; starting work requires a form submission.
+- Only one web task can run at a time. `BENCHMARK_WORKERS=1` in the container runs the five model cases sequentially to reduce memory pressure; local defaults still allow five parallel model cases within one benchmark. The selected 3/5/20 submission cap is unchanged. This is not a spending cap: diagnosis can add API calls, and repeated runs still consume credit.
+- Lean subprocesses receive an allowlisted environment, without the API key or web password. **This is not a security boundary**: Lean and Python still share an OS user and filesystem. Source regex checks, a container, and a password do not protect against all hostile Lean programs. A public service needs a separately isolated verifier worker with no secrets, network restrictions and resource limits.
+- The app retains up to ten recent jobs of each kind and 100 pending contracts in memory. Restarting the server loses active jobs and invalidates open forms; reload the page. Disk traces are not a durable archive on Render's ephemeral filesystem.
+- [Free Render web services](https://render.com/docs/free) sleep after 15 minutes without inbound traffic and can take about a minute to wake. Small free instances may run out of memory or time on harder proofs; this plan is for a short trial, not reliable overnight experiments. Do not upgrade to a paid plan without reviewing its cost.
+
+GitHub Actions tests the code and Docker image without real API credentials. Render hosts the running app and can [deploy after CI checks pass](https://render.com/docs/deploys). GitHub Pages is not used for this backend.
+
 ## What does `PASS` prove?
 
 `PASS` means that Lean accepted a proof showing that the submitted function satisfies the user-confirmed formal contract.
