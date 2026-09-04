@@ -40,6 +40,7 @@ def run_verification_loop(
     agent: LeanAgent,
     max_attempts: int | None = 3,
     on_attempt: Callable[[int, bool], None] | None = None,
+    use_feedback: bool = True,
 ) -> LoopResult:
     previous_code: str | None = None
     error: str | None = None
@@ -64,6 +65,6 @@ def run_verification_loop(
         if verification.passed:
             return LoopResult(True, attempts)
         previous_code = code
-        error = repair_feedback
+        error = repair_feedback if use_feedback else verification.message
 
     return LoopResult(False, attempts)
