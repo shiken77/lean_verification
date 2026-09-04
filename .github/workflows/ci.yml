@@ -1,0 +1,25 @@
+name: Lean verifier CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Lean via elan
+        shell: bash
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Check Lean toolchain
+        run: lean --version
+
+      - name: Run Python tests and 15-case benchmark
+        run: python3 -m unittest discover -s tests -v
