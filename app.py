@@ -27,20 +27,20 @@ Must satisfy:
 """
 
 # The formal contract is stored server-side; the browser receives only a random token.
-PENDING_CONTRACTS: dict[str, tuple[str, str, FormalContract]] = {}
+PENDING_CONTRACTS: dict[str, tuple[str, str, FormalContract, int | None]] = {}
 PENDING_LOCK = threading.Lock()
 BENCHMARK_JOBS: dict[str, dict] = {}
 VERIFY_JOBS: dict[str, dict] = {}
 
 
-def store_contract(specification: str, mode: str, contract: FormalContract) -> str:
+def store_contract(specification: str, mode: str, contract: FormalContract, max_attempts: int | None) -> str:
     token = secrets.token_urlsafe(24)
     with PENDING_LOCK:
-        PENDING_CONTRACTS[token] = (specification, mode, contract)
+        PENDING_CONTRACTS[token] = (specification, mode, contract, max_attempts)
     return token
 
 
-def take_contract(token: str) -> tuple[str, str, FormalContract]:
+def take_contract(token: str) -> tuple[str, str, FormalContract, int | None]:
     with PENDING_LOCK:
         saved = PENDING_CONTRACTS.pop(token, None)
     if saved is None:
@@ -80,12 +80,12 @@ def start_benchmark_job(max_attempts: int | None) -> str:
     return job_id
 
 
-def start_verify_job(specification: str, mode: str, contract: FormalContract) -> str:
+def start_verify_job(specification: str, mode: str, contract: FormalContract, max_attempts: int | None) -> str:
     job_id = secrets.token_urlsafe(16)
     with PENDING_LOCK:
         VERIFY_JOBS[job_id] = {
             "status": "running", "attempts": 0, "current_attempt": 0,
-            "current_step": "Starting", "result": None, "specification": specification, "contract": contract, "error": "",
+            "current_step": "Starting", "result": None, "specification": specification, "contract": contract, "max_attempts": max_attempts, "error": "",
         }
 
     def run() -> None:
@@ -100,7 +100,7 @@ def start_verify_job(specification: str, mode: str, contract: FormalContract) ->
                         "current_step": "Lean accepted the proof" if passed else "Lean failed; sending feedback for repair",
                     })
 
-            result = run_verification_loop(specification, contract, agent, max_attempts=3, on_attempt=progress)
+            result = run_verification_loop(specification, contract, agent, max_attempts=max_attempts, on_attempt=progress)
             with PENDING_LOCK:
                 VERIFY_JOBS[job_id].update({"status": "done", "result": result, "current_step": "Finished"})
         except Exception as exc:
@@ -250,7 +250,7 @@ async function pollVerify() {{
   const job = await response.json();
   const percent = job.status === 'done' ? 100 : Math.min(95, 15 + job.attempts * 28);
   document.getElementById('verify-bar').style.width = percent + '%';
-  document.getElementById('verify-step').textContent = `${{job.current_step}} · attempt ${{job.current_attempt}}/3`;
+  document.getElementById('verify-step').textContent = `${{job.current_step}} · attempt ${{job.current_attempt}}/${{job.max_attempts === null ? 'until success' : job.max_attempts}}`;
   if (job.status === 'done') {{ window.location.href = '/verify?job=' + encodeURIComponent(jobId); return; }}
   if (job.status === 'error') {{ document.getElementById('verify-step').textContent = 'Verification stopped: ' + job.error; return; }}
   setTimeout(pollVerify, 600);
@@ -341,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
                 if job is None:
                     self.send_error(404)
                     return
-                payload = {key: job[key] for key in ("status", "attempts", "current_attempt", "current_step", "error")}
+                payload = {key: job[key] for key in ("status", "attempts", "current_attempt", "current_step", "max_attempts", "error")}
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -374,6 +374,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         specification = form.get("specification", [""])[0].strip()
         mode = form.get("mode", ["demo"])[0]
+        attempt_choice = form.get("attempts", ["3"])[0]
+        max_attempts = None if attempt_choice == "until_success" else int(attempt_choice)
         try:
             if self.path == "/formalize":
                 clear, reason = assess_specification(specification)
@@ -382,14 +384,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
                 contract = agent.formalize(specification)
-                token = store_contract(specification, mode, contract)
+                token = store_contract(specification, mode, contract, max_attempts)
                 self._send(render_confirmation(specification, contract, token))
                 return
 
             if form.get("confirmed", [""])[0] != "yes":
                 raise AgentError("You must confirm the formal contract before verification.")
-            specification, mode, contract = take_contract(form.get("contract_token", [""])[0])
-            self._send(render_verify_loading(start_verify_job(specification, mode, contract)))
+            specification, mode, contract, max_attempts = take_contract(form.get("contract_token", [""])[0])
+            self._send(render_verify_loading(start_verify_job(specification, mode, contract, max_attempts)))
         except (AgentError, ValueError) as exc:
             self._send(render_start(specification, mode, str(exc)), 400)
         except Exception as exc:
