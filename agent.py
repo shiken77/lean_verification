@@ -194,8 +194,8 @@ class DeepSeekAgent:
                 f"User specification:\n{specification}\n\n"
                 f"Locked formal contract:\n{locked_contract}\n\n"
                 f"The previous Lean program failed:\n```lean\n{previous_code}\n```\n\n"
-                f"Lean or policy error:\n{error}\n\n"
-                "Repair the program while preserving the user's specification."
+                f"Repair context and Lean or policy error:\n{error}\n\n"
+                "This is the same task, not a new task. Repair the previous program while preserving the exact locked theorem and all verifier policies."
             )
 
         return extract_lean_code(self._request(GENERATION_PROMPT, task))

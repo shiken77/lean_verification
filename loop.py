@@ -7,7 +7,7 @@ from typing import Protocol
 from collections.abc import Callable
 
 from contracts import FormalContract
-from verifier import VerificationResult, verify_against_contract
+from verifier import VerificationResult, diagnose_verification_failure, verify_against_contract
 
 
 class LeanAgent(Protocol):
@@ -55,6 +55,11 @@ def run_verification_loop(
         if verification.passed:
             return LoopResult(True, attempts)
         previous_code = code
-        error = verification.message
+        error = (
+            f"This is repair attempt {number + 1} for the same locked task; do not start a new task.\n"
+            f"Diagnosis: {diagnose_verification_failure(verification.message)}\n"
+            f"Required action: preserve the exact locked theorem and repair the previous program.\n"
+            f"Lean error: {verification.message}"
+        )
 
     return LoopResult(False, attempts)

@@ -32,6 +32,20 @@ class VerificationResult:
     message: str
 
 
+def diagnose_verification_failure(message: str) -> str:
+    """把 Lean 的原始错误归类成可执行的修复建议。"""
+    text = message.lower()
+    if "policy check failed" in text or any(word in text for word in ("sorry", "admit", "axiom", "unsafe")):
+        return "The submission used a forbidden proof bypass or unsafe construct. Remove it and provide a real proof."
+    if "timeout" in text or "exceeded" in text:
+        return "The proof did not finish within the verifier timeout. Simplify the implementation or use a more direct proof."
+    if "unknown identifier" in text or "unknown constant" in text or "invalid" in text:
+        return "The Lean program has a syntax, name, or type-structure problem. Check declarations and types before repairing the proof."
+    if "unsolved goals" in text or "tactic failed" in text or "unsolved" in text:
+        return "The implementation or proof leaves the locked theorem unproven. Inspect the remaining goal and add the missing reasoning."
+    return "Lean rejected the candidate program. Compare it with the locked theorem and repair the implementation or proof without weakening the contract."
+
+
 def check_source_policy(source: str) -> str | None:
     """在启动 Lean 前进行一个很小的安全和诚信检查。"""
     if len(source) > MAX_SOURCE_LENGTH:
