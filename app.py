@@ -30,6 +30,7 @@ Must satisfy:
 PENDING_CONTRACTS: dict[str, tuple[str, str, FormalContract]] = {}
 PENDING_LOCK = threading.Lock()
 BENCHMARK_JOBS: dict[str, dict] = {}
+VERIFY_JOBS: dict[str, dict] = {}
 
 
 def store_contract(specification: str, mode: str, contract: FormalContract) -> str:
@@ -74,6 +75,37 @@ def start_benchmark_job(max_attempts: int | None) -> str:
         except Exception as exc:
             with PENDING_LOCK:
                 BENCHMARK_JOBS[job_id].update({"status": "error", "error": str(exc)})
+
+    threading.Thread(target=run, daemon=True).start()
+    return job_id
+
+
+def start_verify_job(specification: str, mode: str, contract: FormalContract) -> str:
+    job_id = secrets.token_urlsafe(16)
+    with PENDING_LOCK:
+        VERIFY_JOBS[job_id] = {
+            "status": "running", "attempts": 0, "current_attempt": 0,
+            "current_step": "Starting", "result": None, "specification": specification, "contract": contract, "error": "",
+        }
+
+    def run() -> None:
+        try:
+            agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
+
+            def progress(attempt: int, passed: bool) -> None:
+                with PENDING_LOCK:
+                    VERIFY_JOBS[job_id].update({
+                        "attempts": attempt,
+                        "current_attempt": attempt,
+                        "current_step": "Lean accepted the proof" if passed else "Lean failed; sending feedback for repair",
+                    })
+
+            result = run_verification_loop(specification, contract, agent, max_attempts=3, on_attempt=progress)
+            with PENDING_LOCK:
+                VERIFY_JOBS[job_id].update({"status": "done", "result": result, "current_step": "Finished"})
+        except Exception as exc:
+            with PENDING_LOCK:
+                VERIFY_JOBS[job_id].update({"status": "error", "error": str(exc), "current_step": "Stopped"})
 
     threading.Thread(target=run, daemon=True).start()
     return job_id
@@ -206,6 +238,28 @@ poll();
     return page_shell(content, 4)
 
 
+def render_verify_loading(job_id: str) -> bytes:
+    content = f"""<section class="card"><h2>Verifying the confirmed theorem...</h2>
+<p id="verify-step">Theorem confirmed ✓ · preparing the Agent...</p>
+<div style="height:18px;background:#e7eaf2;border-radius:99px;overflow:hidden;margin:22px 0"><div id="verify-bar" style="height:100%;width:15%;background:var(--blue);transition:width .3s"></div></div>
+<ol><li>Theorem confirmed and locked ✓</li><li>Agent generates the Lean implementation and proof</li><li>Lean checks the code and proof</li><li>If FAIL: return feedback and retry</li></ol></section>
+<script>
+const jobId = {json.dumps(job_id)};
+async function pollVerify() {{
+  const response = await fetch('/verify/status?job=' + encodeURIComponent(jobId));
+  const job = await response.json();
+  const percent = job.status === 'done' ? 100 : Math.min(95, 15 + job.attempts * 28);
+  document.getElementById('verify-bar').style.width = percent + '%';
+  document.getElementById('verify-step').textContent = `${{job.current_step}} · attempt ${{job.current_attempt}}/3`;
+  if (job.status === 'done') {{ window.location.href = '/verify?job=' + encodeURIComponent(jobId); return; }}
+  if (job.status === 'error') {{ document.getElementById('verify-step').textContent = 'Verification stopped: ' + job.error; return; }}
+  setTimeout(pollVerify, 600);
+}}
+pollVerify();
+</script>"""
+    return page_shell(content, 3)
+
+
 def render_stage_info(title: str, description: str, next_href: str, next_label: str, active_step: int) -> bytes:
     content = f"""<section class="card"><h2>{html.escape(title)}</h2>
 <p>{html.escape(description)}</p><p><a class="button" href="{html.escape(next_href, quote=True)}">{html.escape(next_label)}</a>
@@ -227,6 +281,25 @@ class Handler(BaseHTTPRequestHandler):
                 2,
             ))
         elif parsed.path == "/verify":
+            query = parse_qs(parsed.query)
+            job_id = query.get("job", [""])[0]
+            if job_id:
+                with PENDING_LOCK:
+                    job = VERIFY_JOBS.get(job_id)
+                    if job is None:
+                        self.send_error(404)
+                        return
+                    if job["status"] == "running":
+                        self._send(render_verify_loading(job_id))
+                        return
+                    if job["status"] == "error":
+                        self._send(render_start(error=job["error"]), 500)
+                        return
+                    result = job["result"]
+                    specification = job["specification"]
+                    contract = job["contract"]
+                self._send(render_attempts(specification, contract, result))
+                return
             self._send(render_stage_info(
                 "Step 3 · Lean checks",
                 "After the formal contract is confirmed, the agent generates a Lean implementation and proof. Lean checks the proof and returns PASS or FAIL; failed attempts are sent back for repair.",
@@ -261,6 +334,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 results = run_all_cases()
             self._send(render_benchmark(results))
+        elif parsed.path == "/verify/status":
+            job_id = parse_qs(parsed.query).get("job", [""])[0]
+            with PENDING_LOCK:
+                job = VERIFY_JOBS.get(job_id)
+                if job is None:
+                    self.send_error(404)
+                    return
+                payload = {key: job[key] for key in ("status", "attempts", "current_attempt", "current_step", "error")}
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif parsed.path == "/benchmark/status":
             job_id = parse_qs(parsed.query).get("job", [""])[0]
             with PENDING_LOCK:
@@ -302,9 +389,7 @@ class Handler(BaseHTTPRequestHandler):
             if form.get("confirmed", [""])[0] != "yes":
                 raise AgentError("You must confirm the formal contract before verification.")
             specification, mode, contract = take_contract(form.get("contract_token", [""])[0])
-            agent = DeepSeekAgent() if mode == "deepseek" else DemoAgent()
-            result = run_verification_loop(specification, contract, agent, max_attempts=3)
-            self._send(render_attempts(specification, contract, result))
+            self._send(render_verify_loading(start_verify_job(specification, mode, contract)))
         except (AgentError, ValueError) as exc:
             self._send(render_start(specification, mode, str(exc)), 400)
         except Exception as exc:
